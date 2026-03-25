@@ -4,250 +4,166 @@ Brazilian DI Futures Curve Pipeline
 
 DATA SOURCE
 -----------
-B3 (Brasil, Bolsa, Balcão) — the Brazilian exchange.
-Specifically the **DI1 futures daily settlement file** (preço de ajuste diário),
-downloaded from B3's public file server:
+B3 (Brasil, Bolsa, Balcão) via the **PYield** library (github.com/crdcj/PYield).
 
-    https://arquivos.b3.com.br/apinegocios/cotacoesajuste/{YYYY-MM-DD}
+PYield uses two B3 endpoints depending on date:
+  - Dates up to 2025-12-12: legacy HTML endpoint at www2.bmf.com.br
+  - Dates from 2025-12-13: POST to arquivos.b3.com.br/bdi/table/export/csv
 
-This endpoint returns a JSON list of settlement prices for all derivative
-contracts traded on that date, including DI1 (one-day interbank deposit futures).
+Both return the DI1 settlement data. PYield handles authentication headers,
+parsing, and already computes `SettlementRate` and `BDaysToExp`.
 
 DI1 CONTRACT MECHANICS
 -----------------------
 Each DI1 contract expires on the first business day of a given month.
-B3 publishes a daily settlement *price* (PU — Preço Unitário) based on a
-face value of R$ 100,000.  The relationship between PU and the annualised
-252-business-day rate is:
+PU (Preço Unitário) has face value R$ 100,000:
 
-    PU = 100_000 / (1 + rate) ^ (DU / 252)
-    =>  rate = (100_000 / PU) ^ (252 / DU) - 1
+    rate = (100_000 / PU) ^ (252 / DU) - 1     [forward to rate]
+    PU   = 100_000 / (1 + rate) ^ (DU / 252)   [rate to forward]
 
-where DU = number of business days between the reference date and expiry,
-counted using the **ANBIMA calendar** (the standard for Brazilian fixed income).
+DU = business days from ref_date to expiry, using B3/ANBIMA calendar.
+PYield computes both PU and rate directly from the B3 settlement file.
 
 HOLIDAY CALENDAR
 ----------------
-We use the ANBIMA calendar provided by the `bizdays` library.
-ANBIMA (Associação Brasileira das Entidades dos Mercados Financeiro e de
-Capitais) maintains the official list of holidays for the Brazilian fixed
-income market.  This includes:
+PYield uses B3's own business day library internally (`pyield.bday`), which
+matches the ANBIMA calendar — the official Brazilian fixed income standard.
+It covers national holidays + Carnival + Corpus Christi + banking holidays.
 
-    - National public holidays (feriados nacionais)
-    - Carnival Monday and Tuesday (not a national holiday but a market holiday)
-    - Corpus Christi
-    - Other locally declared banking/market holidays
-
-The ANBIMA calendar is the same used by B3, the BCB and all Brazilian
-fixed-income practitioners for DU (dias úteis) calculations.
-
-STORAGE DESIGN
---------------
+STORAGE DESIGN (append-only, no overrides)
+------------------------------------------
 Tables:
-  di_futures_raw    — one row per (ref_date, contract_code): raw B3 settlement
-                      data.  We also store DU here so downstream consumers
-                      don't need to re-calculate it.
-  di_curve_vertices — one row per (ref_date, contract_code): bootstrapped
-                      zero-coupon vertex with DU and rate.
-
-Neither table ever overwrites existing rows.  The unique constraint + upsert
-with `ignore_duplicates=True` means the first snapshot for each
-(ref_date, contract_code) is kept forever, preserving data revision history.
+  di_futures_raw     — raw B3 data: PU + rate + DU per contract per date
+  di_curve_vertices  — cleaned curve: rate_252 + DU, sorted by DU
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 
 import pandas as pd
-import requests
-from bizdays import Calendar
+import pyield as yd
 
 from utils.db import upsert_records
 
 # ---------------------------------------------------------------------------
-# ANBIMA calendar — Brazilian fixed-income market standard
+# Fetch from B3 via PYield
 # ---------------------------------------------------------------------------
-_CALENDAR = Calendar.load("ANBIMA")
 
+def fetch_di_settlements(ref_date: date) -> pd.DataFrame:
+    """Download DI1 settlement data from B3 for *ref_date* using PYield.
 
-def business_days_between(start: date, end: date) -> int:
-    """Business days from *start* (exclusive) to *end* (inclusive), ANBIMA convention."""
-    return _CALENDAR.bizdays(start, end)
-
-
-def next_business_day(ref: date, offset: int = -1) -> date:
-    """Offset business days from ref (negative = backward)."""
-    return _CALENDAR.offset(ref, offset)
-
-
-# ---------------------------------------------------------------------------
-# B3 settlement download
-# ---------------------------------------------------------------------------
-_B3_SETTLEMENTS_URL = (
-    "https://arquivos.b3.com.br/apinegocios/cotacoesajuste/{date}"
-)
-_DI1_PREFIX = "DI1"
-
-
-def _fetch_b3_di_settlements(ref_date: date) -> pd.DataFrame:
-    """Download DI1 settlement prices from B3 for *ref_date*.
-
-    Source: B3 public settlements endpoint (preços de ajuste diário).
-    Filters for DI1 contracts only.
-
-    Returns a DataFrame with columns:
+    Returns a pandas DataFrame with columns:
         ref_date, contract_code, expiry_date, du,
-        settlement_price, open_interest
+        settlement_price, settlement_rate,
+        trade_volume, financial_volume
+    Sorted ascending by du. Empty DataFrame if no data.
     """
-    date_str = ref_date.strftime("%Y-%m-%d")
-    url = _B3_SETTLEMENTS_URL.format(date=date_str)
+    pl_df = yd.futures(date=ref_date, contract_code="DI1")
 
-    resp = requests.get(url, timeout=30, headers={"Accept": "application/json"})
-    resp.raise_for_status()
-    data = resp.json()
+    if pl_df.is_empty():
+        return pd.DataFrame()
 
-    rows = []
-    # B3 response shape: list of dicts or nested under a key — handle both
-    items = data if isinstance(data, list) else data.get("Ativo", data.get("items", []))
+    # PYield returns a Polars DataFrame — convert to pandas
+    df = pl_df.to_pandas()
 
-    for item in items:
-        # Filter to DI1 contracts only
-        code = item.get("Codigo") or item.get("cod") or item.get("contract_code", "")
-        if not code.startswith(_DI1_PREFIX):
-            continue
+    # Keep only contracts with a valid settlement rate
+    df = df[df["SettlementRate"].notna() & (df["SettlementRate"] > 0)].copy()
 
-        expiry_str = (
-            item.get("DataVencimento")
-            or item.get("expiry_date")
-            or item.get("maturity", "")
-        )
-        settlement_price = (
-            item.get("PrecoAjuste")
-            or item.get("settlement_price")
-            or item.get("price")
-        )
-        open_interest = item.get("QuantContrAberto") or item.get("open_interest")
+    if df.empty:
+        return pd.DataFrame()
 
-        if not expiry_str or settlement_price is None:
-            continue
+    result = pd.DataFrame({
+        "ref_date":         ref_date.isoformat(),
+        "contract_code":    df["TickerSymbol"],
+        "expiry_date":      df["ExpirationDate"].astype(str),
+        "du":               df["BDaysToExp"].astype(int),
+        "settlement_price": df["SettlementPrice"],   # PU, face = R$ 100,000
+        "settlement_rate":  df["SettlementRate"],    # annualised rate (e.g. 0.1275)
+        "trade_volume":     df.get("TradeVolume"),
+        "financial_volume": df.get("FinancialVolume"),
+    })
 
-        try:
-            expiry = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
-        except ValueError:
-            continue
-
-        du = business_days_between(ref_date, expiry)
-        if du <= 0:
-            continue
-
-        rows.append(
-            {
-                "ref_date": ref_date.isoformat(),
-                "contract_code": code,
-                "expiry_date": expiry.isoformat(),
-                "du": du,                          # business days to expiry (ANBIMA)
-                "settlement_price": float(settlement_price),
-                "open_interest": int(open_interest) if open_interest else None,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("du").reset_index(drop=True)
-    return df
+    return result.sort_values("du").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
 # Persist raw data (append-only)
 # ---------------------------------------------------------------------------
+
 def save_raw_settlements(df: pd.DataFrame) -> None:
     """Append DI1 raw settlement rows to Supabase.
 
     Conflict key: (ref_date, contract_code).
-    The first snapshot is kept; subsequent runs for the same key are ignored.
+    First snapshot wins — existing rows are never overwritten.
     """
     records = df.to_dict(orient="records")
-    upsert_records(
-        "di_futures_raw",
-        records,
-        conflict_columns=["ref_date", "contract_code"],
-    )
+    upsert_records("di_futures_raw", records, conflict_columns=["ref_date", "contract_code"])
 
 
 # ---------------------------------------------------------------------------
-# Curve bootstrapping
+# Build curve vertices
 # ---------------------------------------------------------------------------
-def _pu_to_rate(pu: float, du: int) -> float:
-    """Convert DI settlement PU to annualised rate (252 bd convention, ANBIMA)."""
-    if du <= 0 or pu <= 0:
-        return float("nan")
-    return (100_000.0 / pu) ** (252.0 / du) - 1.0
 
+def build_curve_vertices(df_raw: pd.DataFrame, ref_date: date) -> pd.DataFrame:
+    """Select and clean the curve vertices from raw settlement data.
 
-def bootstrap_di_curve(df_raw: pd.DataFrame, ref_date: date) -> pd.DataFrame:
-    """Compute zero-coupon DI rates from raw settlement prices.
-
-    For each contract:
+    Since PYield already derives the zero-coupon rate from the PU via:
         rate = (100_000 / PU) ^ (252 / DU) - 1
-
-    DU already stored in raw data (ANBIMA calendar).
+    using B3's own calendar, no further bootstrapping is needed.
+    We just rename columns and drop rows without a settlement rate.
 
     Returns DataFrame with: ref_date, contract_code, expiry_date, du, rate_252
-    sorted ascending by du.
     """
     df = df_raw[df_raw["ref_date"] == ref_date.isoformat()].copy()
-    if df.empty:
-        return pd.DataFrame()
+    df = df[df["settlement_rate"].notna() & (df["du"] > 0)].copy()
+    df = df.sort_values("du").reset_index(drop=True)
 
-    df["rate_252"] = df.apply(
-        lambda r: _pu_to_rate(r["settlement_price"], r["du"]), axis=1
+    return df[["ref_date", "contract_code", "expiry_date", "du", "settlement_rate"]].rename(
+        columns={"settlement_rate": "rate_252"}
     )
-    df = df.dropna(subset=["rate_252"]).sort_values("du").reset_index(drop=True)
-    return df[["ref_date", "contract_code", "expiry_date", "du", "rate_252"]].copy()
 
 
 # ---------------------------------------------------------------------------
-# Persist bootstrapped curve (append-only)
+# Persist curve (append-only)
 # ---------------------------------------------------------------------------
+
 def save_curve_vertices(df: pd.DataFrame) -> None:
     """Append DI curve vertices to Supabase."""
     records = df.to_dict(orient="records")
-    upsert_records(
-        "di_curve_vertices",
-        records,
-        conflict_columns=["ref_date", "contract_code"],
-    )
+    upsert_records("di_curve_vertices", records, conflict_columns=["ref_date", "contract_code"])
 
 
 # ---------------------------------------------------------------------------
 # Public pipeline entry point
 # ---------------------------------------------------------------------------
-def run_pipeline(ref_date: date | None = None) -> pd.DataFrame:
-    """Download → persist raw → bootstrap → persist curve for *ref_date*.
 
-    If ref_date is None, uses the previous business day (ANBIMA calendar).
-    Returns the bootstrapped curve DataFrame.
+def run_pipeline(ref_date: date | None = None) -> pd.DataFrame:
+    """Fetch → save raw → build curve → save curve for *ref_date*.
+
+    If ref_date is None, uses yesterday (PYield resolves the last valid trade date).
+    Returns the curve vertices DataFrame.
     """
+    from datetime import timedelta
     if ref_date is None:
-        ref_date = next_business_day(date.today(), offset=-1)
+        ref_date = date.today() - timedelta(days=1)
 
     print(f"[DI Curve] Pipeline start — ref_date={ref_date}")
 
-    df_raw = _fetch_b3_di_settlements(ref_date)
+    df_raw = fetch_di_settlements(ref_date)
     if df_raw.empty:
-        print(f"[DI Curve] No DI1 data from B3 for {ref_date}")
+        print(f"[DI Curve] No DI1 data from B3 for {ref_date} (holiday or invalid date?)")
         return pd.DataFrame()
 
-    print(f"[DI Curve] {len(df_raw)} DI1 contracts downloaded from B3")
+    print(f"[DI Curve] {len(df_raw)} DI1 contracts fetched from B3")
     save_raw_settlements(df_raw)
 
-    df_curve = bootstrap_di_curve(df_raw, ref_date)
+    df_curve = build_curve_vertices(df_raw, ref_date)
     if df_curve.empty:
-        print("[DI Curve] Bootstrapping returned empty — check settlement prices")
+        print("[DI Curve] No valid curve vertices after filtering")
         return pd.DataFrame()
 
-    print(f"[DI Curve] Curve bootstrapped — {len(df_curve)} vertices")
+    print(f"[DI Curve] {len(df_curve)} vertices saved to di_curve_vertices")
     save_curve_vertices(df_curve)
     return df_curve
 
@@ -255,13 +171,10 @@ def run_pipeline(ref_date: date | None = None) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Loaders for the dashboard (read from Supabase)
 # ---------------------------------------------------------------------------
+
 def load_curve_from_db(ref_date: date | None = None) -> pd.DataFrame:
-    """Load a bootstrapped DI curve from Supabase.
-
-    If ref_date is None, loads the most recent available date.
-    """
+    """Load a DI curve from Supabase. If ref_date is None, loads the latest."""
     from utils.db import get_client
-
     client = get_client()
 
     if ref_date is None:
@@ -289,9 +202,8 @@ def load_curve_from_db(ref_date: date | None = None) -> pd.DataFrame:
 
 
 def load_available_dates() -> list[str]:
-    """Return all dates that have curve data in Supabase, most recent first."""
+    """Return all dates with curve data, most recent first."""
     from utils.db import get_client
-
     client = get_client()
     resp = (
         client.table("di_curve_vertices")
