@@ -1,24 +1,64 @@
 """
 Brazilian DI Futures Curve Pipeline
 ====================================
-1. Download DI1 (One-Day Interbank Deposit) futures settlement prices from B3.
-2. Persist raw settlement data to Supabase (append-only, no overrides).
-3. Bootstrap the DI yield curve (business-day counts with the ANBIMA calendar).
-4. Persist bootstrapped curve vertices to Supabase.
 
-Tables used
+DATA SOURCE
 -----------
-di_futures_raw   : raw settlement data from B3
-di_curve_vertices: bootstrapped zero-coupon vertices (rate per vertex per date)
+B3 (Brasil, Bolsa, Balcão) — the Brazilian exchange.
+Specifically the **DI1 futures daily settlement file** (preço de ajuste diário),
+downloaded from B3's public file server:
+
+    https://arquivos.b3.com.br/apinegocios/cotacoesajuste/{YYYY-MM-DD}
+
+This endpoint returns a JSON list of settlement prices for all derivative
+contracts traded on that date, including DI1 (one-day interbank deposit futures).
+
+DI1 CONTRACT MECHANICS
+-----------------------
+Each DI1 contract expires on the first business day of a given month.
+B3 publishes a daily settlement *price* (PU — Preço Unitário) based on a
+face value of R$ 100,000.  The relationship between PU and the annualised
+252-business-day rate is:
+
+    PU = 100_000 / (1 + rate) ^ (DU / 252)
+    =>  rate = (100_000 / PU) ^ (252 / DU) - 1
+
+where DU = number of business days between the reference date and expiry,
+counted using the **ANBIMA calendar** (the standard for Brazilian fixed income).
+
+HOLIDAY CALENDAR
+----------------
+We use the ANBIMA calendar provided by the `bizdays` library.
+ANBIMA (Associação Brasileira das Entidades dos Mercados Financeiro e de
+Capitais) maintains the official list of holidays for the Brazilian fixed
+income market.  This includes:
+
+    - National public holidays (feriados nacionais)
+    - Carnival Monday and Tuesday (not a national holiday but a market holiday)
+    - Corpus Christi
+    - Other locally declared banking/market holidays
+
+The ANBIMA calendar is the same used by B3, the BCB and all Brazilian
+fixed-income practitioners for DU (dias úteis) calculations.
+
+STORAGE DESIGN
+--------------
+Tables:
+  di_futures_raw    — one row per (ref_date, contract_code): raw B3 settlement
+                      data.  We also store DU here so downstream consumers
+                      don't need to re-calculate it.
+  di_curve_vertices — one row per (ref_date, contract_code): bootstrapped
+                      zero-coupon vertex with DU and rate.
+
+Neither table ever overwrites existing rows.  The unique constraint + upsert
+with `ignore_duplicates=True` means the first snapshot for each
+(ref_date, contract_code) is kept forever, preserving data revision history.
 """
 
 from __future__ import annotations
 
-import io
-import zipfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
-import numpy as np
 import pandas as pd
 import requests
 from bizdays import Calendar
@@ -26,121 +66,149 @@ from bizdays import Calendar
 from utils.db import upsert_records
 
 # ---------------------------------------------------------------------------
-# Calendar (ANBIMA / B3 Brazil business days)
+# ANBIMA calendar — Brazilian fixed-income market standard
 # ---------------------------------------------------------------------------
-cal = Calendar.load("ANBIMA")
+_CALENDAR = Calendar.load("ANBIMA")
 
 
-def _business_days_between(start: date, end: date) -> int:
-    """Count business days from start (exclusive) to end (inclusive)."""
-    return cal.bizdays(start, end)
+def business_days_between(start: date, end: date) -> int:
+    """Business days from *start* (exclusive) to *end* (inclusive), ANBIMA convention."""
+    return _CALENDAR.bizdays(start, end)
+
+
+def next_business_day(ref: date, offset: int = -1) -> date:
+    """Offset business days from ref (negative = backward)."""
+    return _CALENDAR.offset(ref, offset)
 
 
 # ---------------------------------------------------------------------------
-# B3 raw data download
+# B3 settlement download
 # ---------------------------------------------------------------------------
-B3_DAILY_BULLETIN_URL = (
-    "https://www.b3.com.br/pesquisapregao/download?filelist=BDI{date}.zip"
+_B3_SETTLEMENTS_URL = (
+    "https://arquivos.b3.com.br/apinegocios/cotacoesajuste/{date}"
 )
-B3_SETTLEMENTS_URL = (
-    "https://arquivos.b3.com.br/apinegocios/cotacoesajuste?idProduto=DI1&dataReferencia={date}"
-)
+_DI1_PREFIX = "DI1"
 
 
 def _fetch_b3_di_settlements(ref_date: date) -> pd.DataFrame:
-    """Fetch DI1 settlement prices from B3 public API for a given date.
+    """Download DI1 settlement prices from B3 for *ref_date*.
+
+    Source: B3 public settlements endpoint (preços de ajuste diário).
+    Filters for DI1 contracts only.
 
     Returns a DataFrame with columns:
-        contract_code, expiry_date, settlement_rate, open_interest, ref_date
+        ref_date, contract_code, expiry_date, du,
+        settlement_price, open_interest
     """
     date_str = ref_date.strftime("%Y-%m-%d")
-    url = B3_SETTLEMENTS_URL.format(date=date_str)
+    url = _B3_SETTLEMENTS_URL.format(date=date_str)
 
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url, timeout=30, headers={"Accept": "application/json"})
     resp.raise_for_status()
     data = resp.json()
 
     rows = []
-    for item in data.get("Ativo", []):
-        for serie in item.get("Serie", []):
-            expiry_str = serie.get("DataVencimento", "")
-            settlement_price = serie.get("PrecoAjuste")
-            open_interest = serie.get("QuantContrAberto")
-            contract_code = serie.get("Codigo", "")
+    # B3 response shape: list of dicts or nested under a key — handle both
+    items = data if isinstance(data, list) else data.get("Ativo", data.get("items", []))
 
-            if not expiry_str or settlement_price is None:
-                continue
+    for item in items:
+        # Filter to DI1 contracts only
+        code = item.get("Codigo") or item.get("cod") or item.get("contract_code", "")
+        if not code.startswith(_DI1_PREFIX):
+            continue
 
-            try:
-                expiry = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-            except ValueError:
-                continue
+        expiry_str = (
+            item.get("DataVencimento")
+            or item.get("expiry_date")
+            or item.get("maturity", "")
+        )
+        settlement_price = (
+            item.get("PrecoAjuste")
+            or item.get("settlement_price")
+            or item.get("price")
+        )
+        open_interest = item.get("QuantContrAberto") or item.get("open_interest")
 
-            # B3 publishes the settlement PRICE (PU) of a DI contract.
-            # PU = 100_000 / (1 + rate)^(du/252)
-            # where du = business days to expiry. We store price; rate is derived later.
-            rows.append(
-                {
-                    "ref_date": ref_date.isoformat(),
-                    "contract_code": contract_code,
-                    "expiry_date": expiry.isoformat(),
-                    "settlement_price": float(settlement_price),
-                    "open_interest": int(open_interest) if open_interest else None,
-                }
-            )
+        if not expiry_str or settlement_price is None:
+            continue
 
-    return pd.DataFrame(rows)
+        try:
+            expiry = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        du = business_days_between(ref_date, expiry)
+        if du <= 0:
+            continue
+
+        rows.append(
+            {
+                "ref_date": ref_date.isoformat(),
+                "contract_code": code,
+                "expiry_date": expiry.isoformat(),
+                "du": du,                          # business days to expiry (ANBIMA)
+                "settlement_price": float(settlement_price),
+                "open_interest": int(open_interest) if open_interest else None,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("du").reset_index(drop=True)
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Persist raw data
+# Persist raw data (append-only)
 # ---------------------------------------------------------------------------
 def save_raw_settlements(df: pd.DataFrame) -> None:
-    """Append raw DI settlement rows to Supabase.
+    """Append DI1 raw settlement rows to Supabase.
 
-    Conflict key: (ref_date, contract_code) — keeps the first snapshot,
-    never overwrites, preserving revisions history as separate rows when
-    collected_at differs (see extended schema note in README).
+    Conflict key: (ref_date, contract_code).
+    The first snapshot is kept; subsequent runs for the same key are ignored.
     """
     records = df.to_dict(orient="records")
-    upsert_records("di_futures_raw", records, conflict_columns=["ref_date", "contract_code"])
+    upsert_records(
+        "di_futures_raw",
+        records,
+        conflict_columns=["ref_date", "contract_code"],
+    )
 
 
 # ---------------------------------------------------------------------------
 # Curve bootstrapping
 # ---------------------------------------------------------------------------
 def _pu_to_rate(pu: float, du: int) -> float:
-    """Convert DI settlement price (PU) to annualised rate (252 bd convention)."""
+    """Convert DI settlement PU to annualised rate (252 bd convention, ANBIMA)."""
     if du <= 0 or pu <= 0:
         return float("nan")
     return (100_000.0 / pu) ** (252.0 / du) - 1.0
 
 
 def bootstrap_di_curve(df_raw: pd.DataFrame, ref_date: date) -> pd.DataFrame:
-    """Bootstrap the DI zero-coupon curve from raw settlement prices.
+    """Compute zero-coupon DI rates from raw settlement prices.
 
-    Returns a DataFrame with columns:
-        ref_date, expiry_date, du, rate_252, contract_code
-    sorted by du (business days to expiry).
+    For each contract:
+        rate = (100_000 / PU) ^ (252 / DU) - 1
+
+    DU already stored in raw data (ANBIMA calendar).
+
+    Returns DataFrame with: ref_date, contract_code, expiry_date, du, rate_252
+    sorted ascending by du.
     """
     df = df_raw[df_raw["ref_date"] == ref_date.isoformat()].copy()
     if df.empty:
         return pd.DataFrame()
 
-    df["expiry_date_dt"] = pd.to_datetime(df["expiry_date"]).dt.date
-    df["du"] = df["expiry_date_dt"].apply(lambda e: _business_days_between(ref_date, e))
-    df = df[df["du"] > 0].copy()
     df["rate_252"] = df.apply(
         lambda r: _pu_to_rate(r["settlement_price"], r["du"]), axis=1
     )
     df = df.dropna(subset=["rate_252"]).sort_values("du").reset_index(drop=True)
-
-    result = df[["ref_date", "contract_code", "expiry_date", "du", "rate_252"]].copy()
-    return result
+    return df[["ref_date", "contract_code", "expiry_date", "du", "rate_252"]].copy()
 
 
 # ---------------------------------------------------------------------------
-# Persist bootstrapped curve
+# Persist bootstrapped curve (append-only)
 # ---------------------------------------------------------------------------
 def save_curve_vertices(df: pd.DataFrame) -> None:
     """Append DI curve vertices to Supabase."""
@@ -153,41 +221,39 @@ def save_curve_vertices(df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public pipeline entry point
 # ---------------------------------------------------------------------------
 def run_pipeline(ref_date: date | None = None) -> pd.DataFrame:
-    """Download, save, bootstrap and save the DI curve for ref_date.
+    """Download → persist raw → bootstrap → persist curve for *ref_date*.
 
+    If ref_date is None, uses the previous business day (ANBIMA calendar).
     Returns the bootstrapped curve DataFrame.
     """
     if ref_date is None:
-        # Use previous business day (B3 publishes end-of-day)
-        today = date.today()
-        ref_date = cal.offset(today, -1)
+        ref_date = next_business_day(date.today(), offset=-1)
 
-    print(f"[DI Curve] Running pipeline for {ref_date}")
+    print(f"[DI Curve] Pipeline start — ref_date={ref_date}")
 
     df_raw = _fetch_b3_di_settlements(ref_date)
     if df_raw.empty:
-        print(f"[DI Curve] No data found for {ref_date}")
+        print(f"[DI Curve] No DI1 data from B3 for {ref_date}")
         return pd.DataFrame()
 
-    print(f"[DI Curve] {len(df_raw)} contracts downloaded")
+    print(f"[DI Curve] {len(df_raw)} DI1 contracts downloaded from B3")
     save_raw_settlements(df_raw)
 
     df_curve = bootstrap_di_curve(df_raw, ref_date)
     if df_curve.empty:
-        print("[DI Curve] Could not bootstrap curve (no valid contracts)")
+        print("[DI Curve] Bootstrapping returned empty — check settlement prices")
         return pd.DataFrame()
 
     print(f"[DI Curve] Curve bootstrapped — {len(df_curve)} vertices")
     save_curve_vertices(df_curve)
-
     return df_curve
 
 
 # ---------------------------------------------------------------------------
-# Load from Supabase for the dashboard
+# Loaders for the dashboard (read from Supabase)
 # ---------------------------------------------------------------------------
 def load_curve_from_db(ref_date: date | None = None) -> pd.DataFrame:
     """Load a bootstrapped DI curve from Supabase.
@@ -219,12 +285,11 @@ def load_curve_from_db(ref_date: date | None = None) -> pd.DataFrame:
         .order("du")
         .execute()
     )
-    df = pd.DataFrame(resp.data)
-    return df
+    return pd.DataFrame(resp.data)
 
 
 def load_available_dates() -> list[str]:
-    """Return all dates with curve data, most recent first."""
+    """Return all dates that have curve data in Supabase, most recent first."""
     from utils.db import get_client
 
     client = get_client()
@@ -234,5 +299,4 @@ def load_available_dates() -> list[str]:
         .order("ref_date", desc=True)
         .execute()
     )
-    dates = sorted({r["ref_date"] for r in resp.data}, reverse=True)
-    return dates
+    return sorted({r["ref_date"] for r in resp.data}, reverse=True)
