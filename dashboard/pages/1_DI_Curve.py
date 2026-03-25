@@ -84,14 +84,22 @@ def _curve_trace(df: pd.DataFrame, y_col: str, label: str, color: str,
     )
 
 
-def _bar_trace(df: pd.DataFrame, y_col: str, label: str, color: str,
-               opacity: float = 1.0) -> go.Bar:
-    return go.Bar(
-        x=df["contract_code"],
+def _short_code(contract_code: str) -> str:
+    """Strip 'DI1' prefix: 'DI1J26' → 'J26'."""
+    return contract_code[3:] if contract_code.startswith("DI1") else contract_code
+
+
+def _filtered_trace(df: pd.DataFrame, y_col: str, label: str, color: str,
+                    width: float = 2.5, dash: str = "solid", size: int = 7) -> go.Scatter:
+    """Line+marker trace for filtered charts (3/4/5) using short contract code on x-axis."""
+    x = df["contract_code"].map(_short_code)
+    return go.Scatter(
+        x=x,
         y=df[y_col],
+        mode="lines+markers",
         name=label,
-        marker_color=color,
-        opacity=opacity,
+        line=dict(color=color, width=width, dash=dash),
+        marker=dict(size=size, color=color),
         hovertemplate=(
             "<b>%{x}</b><br>"
             "DU: %{customdata[0]}<br>"
@@ -232,8 +240,8 @@ def _filter_by_months(df: pd.DataFrame, months: list[int]) -> pd.DataFrame:
     df["_month"] = pd.to_datetime(df["expiry_date"]).dt.month
     return df[df["_month"].isin(months)].drop(columns=["_month"]).reset_index(drop=True)
 
-# Jan=1, Apr=4, Jul=7, Sep=9
-quarterly_months  = [1, 4, 7, 9]
+# Jan=1, Apr=4, Jul=7, Oct=10
+quarterly_months  = [1, 4, 7, 10]
 semester_months   = [1, 7]
 annual_months     = [1]
 
@@ -250,20 +258,22 @@ c3, c4, c5 = st.columns(3)
 with c3:
     fig3 = go.Figure()
     if not df_q.empty:
-        fig3.add_trace(_bar_trace(df_q, "fwd_pct", latest_date, COLOR_MAIN))
+        fig3.add_trace(_filtered_trace(df_q, "fwd_pct", latest_date, COLOR_MAIN))
     if not df_q_c.empty:
-        fig3.add_trace(_bar_trace(df_q_c, "fwd_pct", compare_date, COLOR_COMP, opacity=0.6))
+        fig3.add_trace(_filtered_trace(df_q_c, "fwd_pct", compare_date, COLOR_COMP,
+                                       width=1.5, dash=DASH_COMP, size=5))
     fig3.update_layout(**_layout(
-        "③ Quarterly Fwd (Jan/Apr/Jul/Sep)", "Contract", "Forward Rate (% a.a.)", height=380,
+        "③ Quarterly Fwd (Jan/Apr/Jul/Oct)", "Contract", "Forward Rate (% a.a.)", height=380,
     ))
     st.plotly_chart(fig3, use_container_width=True)
 
 with c4:
     fig4 = go.Figure()
     if not df_s.empty:
-        fig4.add_trace(_bar_trace(df_s, "fwd_pct", latest_date, COLOR_MAIN))
+        fig4.add_trace(_filtered_trace(df_s, "fwd_pct", latest_date, COLOR_MAIN))
     if not df_s_c.empty:
-        fig4.add_trace(_bar_trace(df_s_c, "fwd_pct", compare_date, COLOR_COMP, opacity=0.6))
+        fig4.add_trace(_filtered_trace(df_s_c, "fwd_pct", compare_date, COLOR_COMP,
+                                       width=1.5, dash=DASH_COMP, size=5))
     fig4.update_layout(**_layout(
         "④ Semester Fwd (Jan/Jul)", "Contract", "Forward Rate (% a.a.)", height=380,
     ))
@@ -272,9 +282,10 @@ with c4:
 with c5:
     fig5 = go.Figure()
     if not df_a.empty:
-        fig5.add_trace(_bar_trace(df_a, "fwd_pct", latest_date, COLOR_MAIN))
+        fig5.add_trace(_filtered_trace(df_a, "fwd_pct", latest_date, COLOR_MAIN))
     if not df_a_c.empty:
-        fig5.add_trace(_bar_trace(df_a_c, "fwd_pct", compare_date, COLOR_COMP, opacity=0.6))
+        fig5.add_trace(_filtered_trace(df_a_c, "fwd_pct", compare_date, COLOR_COMP,
+                                       width=1.5, dash=DASH_COMP, size=5))
     fig5.update_layout(**_layout(
         "⑤ Annual Fwd (January contracts)", "Contract", "Forward Rate (% a.a.)", height=380,
     ))
