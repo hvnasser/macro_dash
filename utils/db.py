@@ -13,6 +13,17 @@ def get_client() -> Client:
     return create_client(url, key)
 
 
+def _clean_records(records: list[dict]) -> list[dict]:
+    """Replace float NaN/Inf with None so records are JSON-serialisable."""
+    import math
+    cleaned = []
+    for row in records:
+        cleaned.append(
+            {k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in row.items()}
+        )
+    return cleaned
+
+
 def upsert_records(table: str, records: list[dict], conflict_columns: list[str]) -> None:
     """Insert records, ignoring duplicates based on conflict_columns.
 
@@ -23,5 +34,6 @@ def upsert_records(table: str, records: list[dict], conflict_columns: list[str])
     if not records:
         return
     client = get_client()
+    clean = _clean_records(records)
     # on_conflict with ignore keeps the old row intact (no override)
-    client.table(table).upsert(records, on_conflict=",".join(conflict_columns), ignore_duplicates=True).execute()
+    client.table(table).upsert(clean, on_conflict=",".join(conflict_columns), ignore_duplicates=True).execute()
