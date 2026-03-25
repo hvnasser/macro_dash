@@ -153,13 +153,59 @@ def build_curve_vertices(df_raw: pd.DataFrame, ref_date: date) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Persist curve (append-only)
+# Persist curve (updates derived columns on conflict)
 # ---------------------------------------------------------------------------
 
 def save_curve_vertices(df: pd.DataFrame) -> None:
-    """Append DI curve vertices to Supabase."""
+    """Save DI curve vertices to Supabase, updating existing rows.
+
+    Unlike raw settlement data, curve vertices are derived values — recalculating
+    (e.g. to add forward_rate) should overwrite the stored row, not skip it.
+    """
     records = df.to_dict(orient="records")
-    upsert_records("di_curve_vertices", records, conflict_columns=["ref_date", "contract_code"])
+    upsert_records(
+        "di_curve_vertices",
+        records,
+        conflict_columns=["ref_date", "contract_code"],
+        update_on_conflict=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Recalculate curve from data already in Supabase (no B3 download)
+# ---------------------------------------------------------------------------
+
+def recalculate_curve_from_db(ref_date: date) -> pd.DataFrame:
+    """Read raw settlements from Supabase, rebuild curve vertices, and save.
+
+    Use this when you want to recompute derived columns (e.g. forward_rate)
+    for a date that was already downloaded — no call to B3 is made.
+    """
+    from utils.db import get_client
+
+    client = get_client()
+    resp = (
+        client.table("di_futures_raw")
+        .select("*")
+        .eq("ref_date", ref_date.isoformat())
+        .execute()
+    )
+    if not resp.data:
+        print(f"[DI Curve] No raw data in DB for {ref_date}")
+        return pd.DataFrame()
+
+    df_raw = pd.DataFrame(resp.data)
+    # Align column name to what build_curve_vertices expects
+    if "settlement_rate" not in df_raw.columns and "rate_252" in df_raw.columns:
+        df_raw = df_raw.rename(columns={"rate_252": "settlement_rate"})
+
+    df_curve = build_curve_vertices(df_raw, ref_date)
+    if df_curve.empty:
+        return pd.DataFrame()
+
+    save_curve_vertices(df_curve)
+    print(f"[DI Curve] Recalculated {len(df_curve)} vertices for {ref_date}")
+    return df_curve
 
 
 # ---------------------------------------------------------------------------

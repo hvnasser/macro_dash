@@ -54,16 +54,26 @@ def _clean_records(records: list[dict]) -> list[dict]:
     return [{k: _sanitize_value(v) for k, v in row.items()} for row in records]
 
 
-def upsert_records(table: str, records: list[dict], conflict_columns: list[str]) -> None:
-    """Insert records, ignoring duplicates based on conflict_columns.
+def upsert_records(
+    table: str,
+    records: list[dict],
+    conflict_columns: list[str],
+    update_on_conflict: bool = False,
+) -> None:
+    """Upsert records into *table*.
 
-    We never overwrite existing rows — this preserves data revisions history.
-    If you want to track revisions, add a 'collected_at' timestamp to the
-    conflict_columns list so each snapshot is stored independently.
+    By default (update_on_conflict=False) existing rows are left untouched —
+    this preserves raw source data and revision history.
+
+    Set update_on_conflict=True for derived/calculated tables (e.g.
+    di_curve_vertices) where recalculating should overwrite the stored values.
     """
     if not records:
         return
     client = get_client()
     clean = _clean_records(records)
-    # on_conflict with ignore keeps the old row intact (no override)
-    client.table(table).upsert(clean, on_conflict=",".join(conflict_columns), ignore_duplicates=True).execute()
+    client.table(table).upsert(
+        clean,
+        on_conflict=",".join(conflict_columns),
+        ignore_duplicates=not update_on_conflict,
+    ).execute()
