@@ -70,7 +70,8 @@ create table if not exists di_curve_vertices (
     contract_code text          not null,
     expiry_date   date          not null,
     du            integer       not null,    -- biz days to expiry (B3/ANBIMA)
-    rate_252      numeric(12,8) not null,    -- annualised zero-coupon rate (decimal)
+    rate_252      numeric(12,8) not null,    -- annualised zero-coupon spot rate (decimal)
+    forward_rate  numeric(12,8),            -- annualised forward rate to next vertex
 
     collected_at  timestamptz   not null default now(),
 
@@ -80,7 +81,11 @@ create table if not exists di_curve_vertices (
 comment on table  di_curve_vertices is
     'DI zero-coupon curve vertices, one per contract per date. Append-only.';
 comment on column di_curve_vertices.rate_252 is
-    'Annualised zero-coupon rate (252 biz-day convention). E.g. 0.1275 = 12.75% a.a.';
+    'Annualised zero-coupon spot rate (252 biz-day convention). E.g. 0.1275 = 12.75% a.a.';
+comment on column di_curve_vertices.forward_rate is
+    'Annualised forward rate from previous vertex to this one (252 b.d. convention).
+     First vertex: forward = spot rate (from ref_date to first expiry).
+     Formula: [(1+r_i)^(du_i/252) / (1+r_{i-1})^(du_{i-1}/252)]^(252/Δdu) - 1';
 
 create index if not exists di_curve_vertices_ref_date_idx on di_curve_vertices (ref_date desc);
 create index if not exists di_curve_vertices_du_idx       on di_curve_vertices (du);

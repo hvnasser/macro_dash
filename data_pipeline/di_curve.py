@@ -111,17 +111,45 @@ def build_curve_vertices(df_raw: pd.DataFrame, ref_date: date) -> pd.DataFrame:
     Since PYield already derives the zero-coupon rate from the PU via:
         rate = (100_000 / PU) ^ (252 / DU) - 1
     using B3's own calendar, no further bootstrapping is needed.
-    We just rename columns and drop rows without a settlement rate.
+    We just rename columns, drop rows without a settlement rate, and compute
+    the forward rate between each pair of consecutive vertices.
 
-    Returns DataFrame with: ref_date, contract_code, expiry_date, du, rate_252
+    Forward rate formula (252 b.d. convention):
+        For the first vertex (i=0):
+            fwd = spot rate  (runs from t=0 to first expiry)
+        For subsequent vertices (i>0):
+            fwd = [(1+r_i)^(du_i/252) / (1+r_{i-1})^(du_{i-1}/252)]^(252/Δdu) - 1
+        where Δdu = du_i - du_{i-1}
+
+    Returns DataFrame with:
+        ref_date, contract_code, expiry_date, du, rate_252, forward_rate
     """
     df = df_raw[df_raw["ref_date"] == ref_date.isoformat()].copy()
     df = df[df["settlement_rate"].notna() & (df["du"] > 0)].copy()
     df = df.sort_values("du").reset_index(drop=True)
+    df = df.rename(columns={"settlement_rate": "rate_252"})
 
-    return df[["ref_date", "contract_code", "expiry_date", "du", "settlement_rate"]].rename(
-        columns={"settlement_rate": "rate_252"}
-    )
+    # Discount factors: DF_i = (1 + rate_i) ^ (du_i / 252)
+    df["_df"] = (1 + df["rate_252"]) ** (df["du"] / 252)
+
+    forward_rates = []
+    for i, row in df.iterrows():
+        if i == 0:
+            # First vertex: forward from ref_date to first expiry = spot rate
+            forward_rates.append(row["rate_252"])
+        else:
+            prev = df.loc[i - 1]
+            delta_du = row["du"] - prev["du"]
+            if delta_du <= 0:
+                forward_rates.append(float("nan"))
+            else:
+                fwd = (row["_df"] / prev["_df"]) ** (252 / delta_du) - 1
+                forward_rates.append(fwd)
+
+    df["forward_rate"] = forward_rates
+    df = df.drop(columns=["_df"])
+
+    return df[["ref_date", "contract_code", "expiry_date", "du", "rate_252", "forward_rate"]]
 
 
 # ---------------------------------------------------------------------------
