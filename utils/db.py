@@ -13,15 +13,45 @@ def get_client() -> Client:
     return create_client(url, key)
 
 
-def _clean_records(records: list[dict]) -> list[dict]:
-    """Replace float NaN/Inf with None so records are JSON-serialisable."""
+def _sanitize_value(v: object) -> object:
+    """Convert a single value to a JSON/Postgres-safe Python native type.
+
+    Handles three cases that commonly arise from pandas DataFrames:
+      - NaN / Inf floats         → None
+      - Whole-number floats      → int  (e.g. 166882.0 → 166882, needed for
+                                         bigint/integer Postgres columns)
+      - numpy scalar types       → Python native (int64 → int, float64 → float)
+      - pandas NA                → None
+    """
     import math
-    cleaned = []
-    for row in records:
-        cleaned.append(
-            {k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in row.items()}
-        )
-    return cleaned
+
+    # pandas NA (from nullable integer / boolean dtypes)
+    try:
+        import pandas as pd
+        if v is pd.NA:
+            return None
+    except Exception:
+        pass
+
+    # numpy scalars → Python natives
+    if hasattr(v, "item"):
+        v = v.item()
+
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return None
+        # whole-number float (e.g. trade_volume=166882.0) must be int for
+        # Postgres bigint columns — numeric/decimal columns accept both
+        if v.is_integer():
+            return int(v)
+        return v
+
+    return v
+
+
+def _clean_records(records: list[dict]) -> list[dict]:
+    """Sanitise every value in every record before sending to Supabase."""
+    return [{k: _sanitize_value(v) for k, v in row.items()} for row in records]
 
 
 def upsert_records(table: str, records: list[dict], conflict_columns: list[str]) -> None:

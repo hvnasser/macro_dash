@@ -80,7 +80,7 @@ def fetch_di_settlements(ref_date: date) -> pd.DataFrame:
         "du":               df["BDaysToExp"].astype(int),
         "settlement_price": df["SettlementPrice"],   # PU, face = R$ 100,000
         "settlement_rate":  df["SettlementRate"],    # annualised rate (e.g. 0.1275)
-        "trade_volume":     df["TradeVolume"].apply(lambda x: int(x) if pd.notna(x) else None) if "TradeVolume" in df.columns else None,
+        "trade_volume":     df.get("TradeVolume"),
         "financial_volume": df.get("FinancialVolume"),
     })
 
