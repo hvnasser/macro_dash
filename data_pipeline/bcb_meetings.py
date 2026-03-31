@@ -61,20 +61,10 @@ _KNOWN_DECISION_DATES: list[date] = [
 
 
 def _build_records() -> list[dict]:
-    records = []
-    year_counter: dict[int, int] = {}
-    for decision_date in sorted(_KNOWN_DECISION_DATES):
-        # effective_date = next business day after the decision
-        effective_date = _CAL.offset(decision_date, 1)
-        yr = decision_date.year
-        year_counter[yr] = year_counter.get(yr, 0) + 1
-        records.append({
-            "decision_date":  decision_date.isoformat(),
-            "effective_date": effective_date.isoformat(),
-            "year":           yr,
-            "meeting_number": year_counter[yr],
-        })
-    return records
+    return [
+        {"decision_date": d.isoformat()}
+        for d in sorted(_KNOWN_DECISION_DATES)
+    ]
 
 
 def populate_meetings() -> None:
@@ -109,6 +99,12 @@ def load_meetings(
     df = pd.DataFrame(resp.data)
     if df.empty:
         return df
+
+    # Derive effective_date (next business day after decision) — not stored in DB
+    df["decision_date_d"] = pd.to_datetime(df["decision_date"]).dt.date
+    df["effective_date"]  = df["decision_date_d"].apply(lambda d: _CAL.offset(d, 1).isoformat())
+    df = df.drop(columns=["decision_date_d"])
+
     if upcoming_only:
         today = date.today().isoformat()
         df = df[df["effective_date"] > today]

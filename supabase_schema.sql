@@ -100,24 +100,17 @@ create index if not exists di_curve_vertices_du_idx       on di_curve_vertices (
 --      effective_date = next business day (Thursday) — when new SELIC takes effect
 -- ---------------------------------------------------------------------------
 create table if not exists bcb_meetings (
-    id              bigserial    primary key,
-
-    decision_date   date         not null,   -- Wednesday: COPOM announces decision
-    effective_date  date         not null,   -- Thursday:  new SELIC rate takes effect
-    year            integer,
-    meeting_number  integer,                 -- 1–8 within the year
-
-    collected_at    timestamptz  not null default now(),
+    id             bigserial    primary key,
+    decision_date  date         not null,   -- Wednesday: COPOM decision day
+    updated_at     timestamptz  not null default now(),
 
     constraint bcb_meetings_uq unique (decision_date)
 );
 
-comment on table  bcb_meetings                  is 'COPOM meeting dates. Effective date is when the new SELIC rate starts compounding in the DI index.';
-comment on column bcb_meetings.decision_date    is 'Wednesday: COPOM announces the new SELIC target after market close.';
-comment on column bcb_meetings.effective_date   is 'Thursday (next biz day): new rate takes effect in the DI overnight index.';
+comment on table  bcb_meetings               is 'COPOM decision dates. effective_date (when new SELIC takes effect) is derived as the next business day after decision_date.';
+comment on column bcb_meetings.decision_date is 'Wednesday: COPOM announces the new SELIC target after market close (~21:00 BRT).';
 
-create index if not exists bcb_meetings_decision_idx  on bcb_meetings (decision_date);
-create index if not exists bcb_meetings_effective_idx on bcb_meetings (effective_date);
+create index if not exists bcb_meetings_decision_idx on bcb_meetings (decision_date);
 
 
 -- ---------------------------------------------------------------------------
