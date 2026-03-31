@@ -150,17 +150,26 @@ df_2y["rate_252"] = pd.to_numeric(df_2y["rate_252"], errors="coerce")
 # Map each COPOM meeting to the DI contract whose period (prev_du, du] contains it.
 # That contract's rate already "prices in" the meeting.
 def _build_meeting_map(curve: pd.DataFrame, pricing: pd.DataFrame) -> dict:
-    """Return {contract_code: row_of_pricing} for meetings within the 2Y horizon."""
+    """Return {contract_code: row_of_pricing} for meetings within the 2Y horizon.
+
+    The meeting is assigned to the contract that expires immediately BEFORE
+    the meeting's effective date — i.e. one row above where the rate change
+    actually kicks in.
+    """
     mapping = {}
     sorted_c = curve.sort_values("du").reset_index(drop=True)
     for _, mtg in pricing.iterrows():
         eff_du = int(mtg["effective_du"])
+        prev_code = None
         prev_du = 0
         for idx, c_row in sorted_c.iterrows():
             curr_du = int(c_row["du"])
             if prev_du < eff_du <= curr_du:
-                mapping[c_row["contract_code"]] = mtg
+                # assign to the contract just BEFORE this period
+                if prev_code is not None:
+                    mapping[prev_code] = mtg
                 break
+            prev_code = c_row["contract_code"]
             prev_du = curr_du
     return mapping
 
