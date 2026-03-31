@@ -133,85 +133,102 @@ st.caption(
 )
 
 # ---------------------------------------------------------------------------
-# Section 1 — Implied changes per meeting
+# Section 1 — DI curve + COPOM pricing table (2 years horizon)
 # ---------------------------------------------------------------------------
-st.subheader("Implied SELIC change per meeting")
+st.subheader("DI Curve — COPOM pricing")
 
-if df_pricing.empty:
-    st.info("No upcoming meetings within the curve horizon.")
-else:
-    col_chart, col_table = st.columns([3, 2])
+# Limit to ~2 years
+_2Y_DU = int(252 * 2)
+df_2y = (
+    df_curve[df_curve["du"] <= _2Y_DU]
+    .sort_values("du")
+    .reset_index(drop=True)
+    .copy()
+)
+df_2y["rate_252"] = pd.to_numeric(df_2y["rate_252"], errors="coerce")
 
-    with col_chart:
-        colors = [
-            "#51CF66" if v < 0 else ("#FF6B6B" if v > 0 else "#868E96")
-            for v in df_pricing["change_bps"]
-        ]
-        fig_bar = go.Figure(
-            go.Bar(
-                x=df_pricing["decision_date"],
-                y=df_pricing["change_bps"],
-                marker_color=colors,
-                text=df_pricing["change_bps"].apply(lambda v: f"{v:+.0f} bps"),
-                textposition="outside",
-                hovertemplate=(
-                    "<b>%{x}</b><br>"
-                    "Change: %{y:+.1f} bps<br>"
-                    "Rate before: %{customdata[0]:.2f}%<br>"
-                    "Rate after:  %{customdata[1]:.2f}%<extra></extra>"
-                ),
-                customdata=df_pricing[["rate_before", "rate_after"]].values,
+# Map each COPOM meeting to the DI contract whose period (prev_du, du] contains it.
+# That contract's rate already "prices in" the meeting.
+def _build_meeting_map(curve: pd.DataFrame, pricing: pd.DataFrame) -> dict:
+    """Return {contract_code: row_of_pricing} for meetings within the 2Y horizon."""
+    mapping = {}
+    sorted_c = curve.sort_values("du").reset_index(drop=True)
+    for _, mtg in pricing.iterrows():
+        eff_du = int(mtg["effective_du"])
+        prev_du = 0
+        for idx, c_row in sorted_c.iterrows():
+            curr_du = int(c_row["du"])
+            if prev_du < eff_du <= curr_du:
+                mapping[c_row["contract_code"]] = mtg
+                break
+            prev_du = curr_du
+    return mapping
+
+meeting_map = _build_meeting_map(df_2y, df_pricing) if not df_pricing.empty else {}
+
+# Build display rows
+rows = []
+for _, c_row in df_2y.iterrows():
+    code  = str(c_row["contract_code"])
+    mtg   = meeting_map.get(code)
+    rows.append({
+        "Contract":           code[3:] if code.startswith("DI1") else code,
+        "Maturity":           str(c_row["expiry_date"]),
+        "Rate (%)":           round(float(c_row["rate_252"]) * 100, 4),
+        "│":                  "",   # visual separator column
+        "COPOM Effective":    str(mtg["effective_date"]) if mtg is not None else "",
+        "Priced (bps)":       float(mtg["change_bps"])  if mtg is not None else None,
+        "CDI post-dec. (%)":  float(mtg["rate_after"])  if mtg is not None else None,
+    })
+
+tbl = pd.DataFrame(rows)
+
+# --- Styler ---
+has_meeting = tbl["COPOM Effective"] != ""
+
+def _style_table(df):
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+
+    # Highlight rows with a COPOM meeting
+    for col in df.columns:
+        styles.loc[has_meeting, col] = "background-color: rgba(0,200,255,0.07)"
+
+    # Separator column — thin, muted
+    styles["│"] = "color: #444444; width: 8px"
+
+    # Priced bps colour
+    for i, val in df["Priced (bps)"].items():
+        if pd.notna(val) and val != 0:
+            color = "#51CF66" if val < 0 else "#FF6B6B"
+            styles.loc[i, "Priced (bps)"] = (
+                styles.loc[i, "Priced (bps)"] + f"; color: {color}; font-weight: bold"
             )
-        )
-        fig_bar.update_layout(
-            title="Priced change per COPOM meeting (bps)",
-            xaxis_title="Decision date",
-            yaxis_title="Change (bps)",
-            template=CHART_TEMPLATE,
-            height=380,
-            margin=dict(t=50, b=40),
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
 
-    with col_table:
-        tbl = df_pricing[
-            ["decision_date", "effective_date", "rate_before", "rate_after",
-             "change_bps", "verify_rate"]
-        ].copy()
-        tbl.columns = ["Decision", "Effective", "Before (%)", "After (%)",
-                       "Δ (bps)", "Verify (%)"]
-        # Verify column: recomputed spot rate from implied path — should match DI
-        # Find nearest DI vertex for each meeting and compute difference
-        tbl["DI spot (%)"] = tbl["Decision"].apply(
-            lambda d: _nearest_di_rate(d, df_curve, ref_date)
-        )
-        tbl["Error (bps)"] = ((tbl["Verify (%)"] - tbl["DI spot (%)"]) * 100).round(2)
+    return styles
 
-        def _color_bps(val):
-            if pd.isna(val) or val == 0:
-                return ""
-            return "color: #51CF66" if val < 0 else "color: #FF6B6B"
+fmt = {
+    "Rate (%)":          "{:.4f}",
+    "Priced (bps)":      "{:+.1f}",
+    "CDI post-dec. (%)": "{:.4f}",
+}
 
-        def _color_err(val):
-            if pd.isna(val):
-                return ""
-            return "color: #FF6B6B" if abs(val) > 0.5 else "color: #868E96"
+st.dataframe(
+    tbl.style.apply(_style_table, axis=None).format(fmt, na_rep=""),
+    use_container_width=True,
+    height=min(60 + len(tbl) * 35, 700),
+    column_config={
+        "│": st.column_config.TextColumn(width="small"),
+        "COPOM Effective": st.column_config.TextColumn(width="medium"),
+        "Priced (bps)":    st.column_config.NumberColumn(format="%+.1f bps"),
+        "CDI post-dec. (%)": st.column_config.NumberColumn(format="%.4f %%"),
+    },
+)
+st.caption(
+    "**CDI post-dec.**: implied SELIC rate after the COPOM decision, "
+    "calibrated so that the compounded daily rate exactly reproduces the DI contract price."
+)
 
-        st.dataframe(
-            tbl.style
-            .format({
-                "Before (%)": "{:.4f}", "After (%)": "{:.4f}",
-                "Verify (%)": "{:.4f}", "DI spot (%)": "{:.4f}",
-                "Δ (bps)": "{:+.1f}", "Error (bps)": "{:+.2f}",
-            })
-            .applymap(_color_bps, subset=["Δ (bps)"])
-            .applymap(_color_err, subset=["Error (bps)"]),
-            use_container_width=True,
-            height=400,
-        )
-        st.caption("**Verify**: spot rate recomputed from implied SELIC path. "
-                   "**Error** should be ~0 bps — confirms the pricing is calibrated "
-                   "to exactly reproduce the DI contract.")
+
 
 # ---------------------------------------------------------------------------
 # Section 2 — Implied SELIC path
