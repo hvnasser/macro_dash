@@ -69,18 +69,18 @@ DASH_COMP = "dash"
 def _curve_trace(df: pd.DataFrame, y_col: str, label: str, color: str,
                  width: float = 2.5, dash: str = "solid", size: int = 6) -> go.Scatter:
     return go.Scatter(
-        x=df["du"],
+        x=df["contract_code"].map(_short_code),
         y=df[y_col],
         mode="lines+markers",
         name=label,
         line=dict(color=color, width=width, dash=dash),
         marker=dict(size=size, color=color),
         hovertemplate=(
-            "<b>%{customdata[0]}</b><br>"
-            "DU: %{x}<br>"
+            "<b>%{x}</b><br>"
+            "DU: %{customdata[0]}<br>"
             "Rate: %{y:.3f}%<extra></extra>"
         ),
-        customdata=df[["contract_code"]].values,
+        customdata=df[["du"]].values,
     )
 
 
@@ -215,7 +215,7 @@ with c1:
                                     width=1.5, dash=DASH_COMP, size=5))
     fig1.update_layout(**_layout(
         f"① Spot Zero-Coupon Curve — {latest_date}",
-        "Business Days to Expiry (DU)", "Rate (% a.a.)", height=420,
+        "Contract", "Rate (% a.a.)", height=420,
     ))
     st.plotly_chart(fig1, use_container_width=True)
 
@@ -227,7 +227,7 @@ with c2:
                                     width=1.5, dash=DASH_COMP, size=5))
     fig2.update_layout(**_layout(
         f"② Full Forward Rate Curve — {latest_date}",
-        "Business Days to Expiry (DU)", "Forward Rate (% a.a.)", height=420,
+        "Contract", "Forward Rate (% a.a.)", height=420,
     ))
     st.plotly_chart(fig2, use_container_width=True)
 
