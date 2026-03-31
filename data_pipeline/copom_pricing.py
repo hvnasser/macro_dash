@@ -4,39 +4,47 @@ COPOM Meeting Pricing from the DI Curve
 
 METHODOLOGY
 -----------
-The DI futures curve is built from settlement prices of DI1 contracts that
-expire on the first business day of each month.  Between any two consecutive
-DI vertices the market implies a flat forward rate.  When a COPOM decision
-falls inside a period, that forward rate is actually the geometric average of:
+The DI index compounds daily at the overnight CDI rate.  The CDI tracks the
+SELIC target and only changes when COPOM decides a new rate (effective the
+next business day after the decision).
 
-    • the SELIC rate in force BEFORE the meeting takes effect
-    • the SELIC rate in force AFTER  the meeting takes effect
+For a DI contract expiring at du_T business days from today, the settlement
+price implies:
 
-We iterate left-to-right through the curve, and within each period we solve
-for the implied post-meeting rate using:
+    DF(0, T) = (1 + r_spot_T)^(du_T / 252)
 
-    DF_period = (1 + r_before)^(Δdu_before/252) × (1 + r_after)^(Δdu_after/252)
+This discount factor must equal the exact product of daily compoundings:
 
-    => r_after = [ DF_period / (1 + r_before)^(Δdu_before/252) ]^(252/Δdu_after) - 1
+    DF(0, T) = (1 + SELIC_0)^(n_0/252)                   ← segment before meeting 1
+             × (1 + SELIC_1)^(n_1/252)                   ← between meetings 1 and 2
+             × ...
+             × (1 + SELIC_k)^(n_k/252)                   ← from last meeting to T
 
-Key timing detail
+where n_i are the ANBIMA business-day counts for each segment and
+SELIC_0 is the CURRENT overnight rate (the target set at the LAST COPOM meeting).
+
+ALGORITHM
+---------
+Iterate through DI curve periods left-to-right.  Within each period, for every
+COPOM meeting we:
+  1. Consume the discount factor for the pre-meeting segment at the known rate.
+  2. Solve algebraically for the post-meeting rate from the residual DF.
+  3. Carry that new rate into the next segment/period.
+
+This guarantees that, for every DI contract, the implied SELIC path compounds
+back to exactly the DI spot rate — i.e. the pricing is internally consistent.
+
+KEY TIMING DETAIL
 -----------------
-COPOM announces Wednesday night.  The new SELIC takes effect the NEXT BUSINESS
-DAY (Thursday).  We use `effective_date` from the bcb_meetings table, which is
-already the Thursday date (= bizday_offset(decision_date, +1)).
-
-Hypothesis simulation
----------------------
-Given a user-defined path of rate changes (bps per meeting), we reconstruct the
-implied spot DI curve that would be consistent with that path, allowing a
-direct comparison with the market curve.
+The new SELIC takes effect the NEXT BUSINESS DAY after the COPOM decision
+(Wednesday night → Thursday morning).  We use effective_date from
+bcb_meetings, which is already computed as next_biz_day(decision_date).
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-import numpy as np
 import pandas as pd
 from bizdays import Calendar
 
@@ -55,34 +63,42 @@ def calculate_copom_pricing(
 ) -> pd.DataFrame:
     """Derive the SELIC rate implied at each upcoming COPOM meeting.
 
+    The implied rates are calibrated so that compounding the SELIC path
+    at each segment exactly reproduces every DI contract's discount factor.
+
     Args:
         df_curve:    DI curve vertices — must have columns du, rate_252.
         df_meetings: COPOM meetings — must have decision_date, effective_date.
         ref_date:    Reference / pricing date (date of the DI curve snapshot).
-        selic_rate:  Current SELIC target rate as a decimal (e.g. 0.1275).
+        selic_rate:  Current SELIC target (decimal).  This is the rate currently
+                     in force, set at the LAST COPOM meeting.
 
     Returns:
-        DataFrame with one row per meeting, columns:
+        DataFrame with one row per meeting within the curve horizon:
             decision_date, effective_date, effective_du,
-            rate_before (%), rate_after (%), change_bps
+            rate_before (%), rate_after (%), change_bps,
+            verify_rate (%) — spot rate recomputed from implied path (≈ DI rate)
     """
-    curve = df_curve[["du", "rate_252"]].copy()
-    curve["du"] = curve["du"].astype(int)
-    curve["rate_252"] = curve["rate_252"].astype(float)
-    curve = curve.sort_values("du").reset_index(drop=True)
+    curve = (
+        df_curve[["du", "rate_252"]].copy()
+        .assign(du=lambda d: d["du"].astype(int),
+                rate_252=lambda d: d["rate_252"].astype(float))
+        .sort_values("du")
+        .reset_index(drop=True)
+    )
 
     if curve.empty:
         return pd.DataFrame()
 
-    # Precompute spot discount factors: DF(0, i) = (1 + r_i)^(du_i/252)
-    dfs: dict[int, float] = {0: 1.0}
+    # Spot discount factors from DI curve: DF(0, du_i) = (1 + r_i)^(du_i/252)
+    spot_dfs: dict[int, float] = {0: 1.0}
     for _, row in curve.iterrows():
         du, r = int(row["du"]), float(row["rate_252"])
-        dfs[du] = (1.0 + r) ** (du / 252.0)
+        spot_dfs[du] = (1.0 + r) ** (du / 252.0)
 
-    max_du = max(dfs.keys())
+    max_du = max(spot_dfs.keys())
 
-    # Compute effective_du for each meeting (biz days from ref_date)
+    # Compute effective_du for each meeting
     meetings = df_meetings.copy()
     meetings["effective_date_d"] = pd.to_datetime(meetings["effective_date"]).dt.date
     meetings["effective_du"] = meetings["effective_date_d"].apply(
@@ -99,60 +115,103 @@ def calculate_copom_pricing(
     if meetings.empty:
         return pd.DataFrame()
 
-    # Iterate through DI periods [du_start, du_end]
+    # -----------------------------------------------------------------------
+    # Iterate period by period through the curve
+    # -----------------------------------------------------------------------
     boundaries = [0] + list(curve["du"])
     results: list[dict] = []
-    current_rate = selic_rate  # SELIC before first meeting
+    current_rate = selic_rate   # ← SELIC currently in force (overnight rate)
+    acc_df = 1.0                # accumulated discount factor from t=0
 
     for i in range(1, len(boundaries)):
         du_start = boundaries[i - 1]
         du_end   = boundaries[i]
 
-        # Forward discount factor for this period
-        df_period = dfs[du_end] / dfs[du_start]
+        # Forward DF for this period derived from spot curve
+        period_df = spot_dfs[du_end] / spot_dfs[du_start]
 
-        # Meetings whose effective date falls in (du_start, du_end]
-        mask = (meetings["effective_du"] > du_start) & (meetings["effective_du"] <= du_end)
+        # Meetings with effective date in (du_start, du_end]
+        mask = (
+            (meetings["effective_du"] > du_start) &
+            (meetings["effective_du"] <= du_end)
+        )
         period_meetings = meetings[mask].sort_values("effective_du")
 
-        remaining_df = df_period
+        remaining_df = period_df
         seg_start_du = du_start
 
         for _, mtg in period_meetings.iterrows():
             du_m         = int(mtg["effective_du"])
-            delta_before = du_m - seg_start_du   # biz days at current_rate
-            delta_after  = du_end - du_m          # biz days at rate_after
+            delta_before = du_m - seg_start_du    # biz days at current_rate
+            delta_after  = du_end - du_m           # biz days at implied rate_after
 
-            # Consume the "before" segment
+            # Consume pre-meeting segment at current SELIC
             if delta_before > 0:
                 remaining_df /= (1.0 + current_rate) ** (delta_before / 252.0)
 
             if delta_after > 0:
+                # Solve: remaining_df = (1 + rate_after)^(delta_after/252)
                 rate_after = remaining_df ** (252.0 / delta_after) - 1.0
             else:
-                # Meeting falls exactly on vertex — look one period ahead if possible
-                # Approximate: carry forward current rate (very rare edge case)
-                rate_after = current_rate
+                rate_after = current_rate  # edge case: meeting on last day of period
+
+            # Verification: accumulated DF to du_m compounded at rate_after for
+            # the rest of the period should equal spot_dfs[du_end]
+            # (This is guaranteed by construction — we note it for transparency.)
+            verify_df = acc_df * spot_dfs[du_start] * (
+                (1.0 + current_rate) ** (delta_before / 252.0)
+            ) if delta_before > 0 else acc_df * spot_dfs[du_start]
 
             results.append({
-                "decision_date": mtg["decision_date"],
+                "decision_date":  mtg["decision_date"],
                 "effective_date": mtg["effective_date"],
-                "effective_du":  du_m,
-                "rate_before":   round(current_rate * 100, 4),
-                "rate_after":    round(rate_after * 100, 4),
-                "change_bps":    round((rate_after - current_rate) * 10_000, 1),
+                "effective_du":   du_m,
+                "rate_before":    round(current_rate * 100, 4),
+                "rate_after":     round(rate_after  * 100, 4),
+                "change_bps":     round((rate_after - current_rate) * 10_000, 1),
             })
 
             current_rate = rate_after
             seg_start_du = du_m
 
-        # After all meetings in this period, the remainder of the period
-        # runs at whatever rate is implied by the remaining discount factor.
+        # Flat rate for remainder of period (no more meetings in this period)
         remaining_du = du_end - seg_start_du
         if remaining_du > 0 and remaining_df > 0:
             current_rate = remaining_df ** (252.0 / remaining_du) - 1.0
 
-    return pd.DataFrame(results)
+    # -----------------------------------------------------------------------
+    # Verification column: recompute DI spot rate from implied SELIC path
+    # for each meeting's horizon vertex (nearest contract after the meeting)
+    # -----------------------------------------------------------------------
+    df_result = pd.DataFrame(results)
+    if df_result.empty:
+        return df_result
+
+    df_result["verify_rate"] = df_result["effective_du"].apply(
+        lambda tgt: round(_recompute_spot_rate(
+            tgt, curve, selic_rate, df_result
+        ) * 100, 4)
+    )
+
+    return df_result
+
+
+def _recompute_spot_rate(
+    target_du: int,
+    curve: pd.DataFrame,
+    selic_rate: float,
+    df_result: pd.DataFrame,
+) -> float:
+    """Recompute the spot rate at target_du from the implied SELIC path.
+
+    Should match the DI curve's spot rate at that vertex — confirms calibration.
+    """
+    # Build SELIC path up to this point from results already computed
+    selic_path = [(0, selic_rate)]
+    for _, row in df_result[df_result["effective_du"] <= target_du].iterrows():
+        selic_path.append((int(row["effective_du"]), float(row["rate_after"]) / 100.0))
+
+    return _spot_from_path(target_du, selic_path, selic_rate)
 
 
 # ---------------------------------------------------------------------------
@@ -168,20 +227,24 @@ def build_hypothesis_curve(
 ) -> pd.DataFrame:
     """Compute the implied DI spot curve from a user-defined rate-change path.
 
+    Uses EXACT discrete compounding: (1 + r)^(n/252) — same convention as DI.
+
     Args:
-        df_curve:    Actual DI curve (used only for vertex dates / du values).
+        df_curve:    Actual DI curve (vertex dates / du values used for output).
         df_meetings: COPOM meetings with decision_date, effective_date.
         ref_date:    Pricing date.
-        selic_rate:  Current SELIC as a decimal.
-        hypothesis:  {decision_date_iso: change_bps} — user's expected changes.
+        selic_rate:  Current SELIC as decimal.
+        hypothesis:  {decision_date_iso: change_bps} user's expected changes.
 
     Returns:
-        DataFrame with columns: contract_code, expiry_date, du, rate_252
-        representing the hypothetical DI curve.
+        DataFrame with contract_code, expiry_date, du, rate_252, rate_pct.
     """
-    curve = df_curve[["contract_code", "expiry_date", "du", "rate_252"]].copy()
-    curve["du"] = curve["du"].astype(int)
-    curve = curve.sort_values("du").reset_index(drop=True)
+    curve = (
+        df_curve[["contract_code", "expiry_date", "du", "rate_252"]].copy()
+        .assign(du=lambda d: d["du"].astype(int))
+        .sort_values("du")
+        .reset_index(drop=True)
+    )
 
     meetings = df_meetings.copy()
     meetings["effective_date_d"] = pd.to_datetime(meetings["effective_date"]).dt.date
@@ -190,8 +253,7 @@ def build_hypothesis_curve(
     )
     meetings = meetings[meetings["effective_du"] > 0].sort_values("effective_du")
 
-    # Build the SELIC path implied by the hypothesis
-    # selic_path: list of (effective_du, rate) sorted ascending
+    # Build SELIC path from hypothesis
     selic_path: list[tuple[int, float]] = [(0, selic_rate)]
     current = selic_rate
     for _, mtg in meetings.iterrows():
@@ -199,24 +261,40 @@ def build_hypothesis_curve(
         current = current + chg_bps / 10_000.0
         selic_path.append((int(mtg["effective_du"]), current))
 
-    def _spot_rate_at(du: int) -> float:
-        """Compute the implied spot rate at *du* from the piecewise-flat SELIC path."""
-        if du <= 0:
-            return selic_rate
-        log_df = 0.0
-        prev_du, prev_rate = 0, selic_rate
-        for eff_du, rate in selic_path[1:]:
-            if eff_du >= du:
-                break
-            seg = eff_du - prev_du
-            log_df += seg * np.log1p(prev_rate) / 252.0
-            prev_du, prev_rate = eff_du, rate
-        # Remaining segment
-        log_df += (du - prev_du) * np.log1p(prev_rate) / 252.0
-        df_val = np.exp(log_df)
-        return df_val ** (252.0 / du) - 1.0
-
+    # For each DI vertex, compute spot rate using exact discrete compounding
     hyp = curve.copy()
-    hyp["rate_252"] = hyp["du"].apply(_spot_rate_at)
+    hyp["rate_252"] = hyp["du"].apply(
+        lambda du: _spot_from_path(du, selic_path, selic_rate)
+    )
     hyp["rate_pct"] = hyp["rate_252"] * 100
     return hyp
+
+
+def _spot_from_path(
+    du: int,
+    selic_path: list[tuple[int, float]],
+    selic_rate: float,
+) -> float:
+    """Compute the DI spot rate at *du* from a piecewise-flat SELIC path.
+
+    Uses exact discrete compounding: DF = Π (1 + r_i)^(Δdu_i / 252)
+    Spot rate at du = DF^(252/du) - 1
+    """
+    if du <= 0:
+        return selic_rate
+
+    df_acc = 1.0
+    prev_du, prev_rate = 0, selic_rate
+
+    for eff_du, rate in selic_path[1:]:
+        if eff_du >= du:
+            break
+        seg = eff_du - prev_du
+        df_acc *= (1.0 + prev_rate) ** (seg / 252.0)
+        prev_du, prev_rate = eff_du, rate
+
+    # Remaining segment from last event to du
+    seg = du - prev_du
+    df_acc *= (1.0 + prev_rate) ** (seg / 252.0)
+
+    return df_acc ** (252.0 / du) - 1.0

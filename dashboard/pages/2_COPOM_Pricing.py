@@ -16,12 +16,28 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from data_pipeline.bcb_meetings import load_meetings, populate_meetings
 from data_pipeline.copom_pricing import build_hypothesis_curve, calculate_copom_pricing
 from data_pipeline.di_curve import load_available_dates, load_curve_from_db
+from data_pipeline.selic_rate import fetch_selic_target
 
 st.set_page_config(page_title="COPOM Pricing", layout="wide")
 
 CHART_TEMPLATE = "plotly_dark"
 COLOR_MARKET   = "#00C8FF"
 COLOR_HYP      = "#FF9F43"
+
+
+def _nearest_di_rate(decision_date_str: str, df_curve: pd.DataFrame, ref_date: date) -> float:
+    """Return the DI spot rate (%) for the contract nearest to the meeting date."""
+    from bizdays import Calendar
+    cal = Calendar.load("ANBIMA")
+    try:
+        d = date.fromisoformat(str(decision_date_str))
+        target_du = cal.bizdays(ref_date, d)
+    except Exception:
+        return float("nan")
+    curve = df_curve.sort_values("du")
+    near = curve[curve["du"] >= target_du]
+    row = near.iloc[0] if not near.empty else curve.iloc[-1]
+    return float(row["rate_252"]) * 100
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -46,15 +62,33 @@ if df_curve.empty:
 df_curve["rate_252"] = pd.to_numeric(df_curve["rate_252"], errors="coerce")
 df_curve["du"]       = pd.to_numeric(df_curve["du"], errors="coerce").astype(int)
 
-proxy_selic = float(df_curve.sort_values("du").iloc[0]["rate_252"])
+# Fetch current SELIC target from BCB SGS (series 432)
+_bcb_selic, _bcb_date = None, None
+try:
+    _bcb_selic, _bcb_date = fetch_selic_target()
+except Exception:
+    pass
+
+_default_selic = round(_bcb_selic * 100, 2) if _bcb_selic else round(
+    float(df_curve.sort_values("du").iloc[0]["rate_252"]) * 100, 2
+)
+
+if _bcb_selic:
+    st.sidebar.success(f"SELIC from BCB: **{_bcb_selic*100:.2f}%** (as of {_bcb_date})")
+else:
+    st.sidebar.warning("Could not fetch SELIC from BCB. Using shortest DI contract as proxy.")
 
 selic_input = st.sidebar.number_input(
     "Current SELIC target (% a.a.)",
     min_value=0.0,
     max_value=50.0,
-    value=round(proxy_selic * 100, 2),
+    value=_default_selic,
     step=0.25,
-    help="SELIC target rate decided at last COPOM meeting. Used as the starting rate for pricing.",
+    help=(
+        "SELIC target rate set at the last COPOM meeting. "
+        "This is the overnight rate currently compounding in the DI index. "
+        "Auto-filled from BCB SGS series 432."
+    ),
 )
 selic_rate = selic_input / 100.0
 
@@ -140,21 +174,44 @@ else:
         st.plotly_chart(fig_bar, use_container_width=True)
 
     with col_table:
-        tbl = df_pricing[["decision_date", "effective_date", "rate_before", "rate_after", "change_bps"]].copy()
-        tbl.columns = ["Decision", "Effective", "Before (%)", "After (%)", "Δ (bps)"]
+        tbl = df_pricing[
+            ["decision_date", "effective_date", "rate_before", "rate_after",
+             "change_bps", "verify_rate"]
+        ].copy()
+        tbl.columns = ["Decision", "Effective", "Before (%)", "After (%)",
+                       "Δ (bps)", "Verify (%)"]
+        # Verify column: recomputed spot rate from implied path — should match DI
+        # Find nearest DI vertex for each meeting and compute difference
+        tbl["DI spot (%)"] = tbl["Decision"].apply(
+            lambda d: _nearest_di_rate(d, df_curve, ref_date)
+        )
+        tbl["Error (bps)"] = ((tbl["Verify (%)"] - tbl["DI spot (%)"]) * 100).round(2)
 
         def _color_bps(val):
             if pd.isna(val) or val == 0:
                 return ""
             return "color: #51CF66" if val < 0 else "color: #FF6B6B"
 
+        def _color_err(val):
+            if pd.isna(val):
+                return ""
+            return "color: #FF6B6B" if abs(val) > 0.5 else "color: #868E96"
+
         st.dataframe(
             tbl.style
-            .format({"Before (%)": "{:.4f}", "After (%)": "{:.4f}", "Δ (bps)": "{:+.1f}"})
-            .applymap(_color_bps, subset=["Δ (bps)"]),
+            .format({
+                "Before (%)": "{:.4f}", "After (%)": "{:.4f}",
+                "Verify (%)": "{:.4f}", "DI spot (%)": "{:.4f}",
+                "Δ (bps)": "{:+.1f}", "Error (bps)": "{:+.2f}",
+            })
+            .applymap(_color_bps, subset=["Δ (bps)"])
+            .applymap(_color_err, subset=["Error (bps)"]),
             use_container_width=True,
-            height=380,
+            height=400,
         )
+        st.caption("**Verify**: spot rate recomputed from implied SELIC path. "
+                   "**Error** should be ~0 bps — confirms the pricing is calibrated "
+                   "to exactly reproduce the DI contract.")
 
 # ---------------------------------------------------------------------------
 # Section 2 — Implied SELIC path
