@@ -83,14 +83,18 @@ if st.button("⬇️ Download & Save raw settlements", type="primary"):
         try:
             df_raw = fetch_di_settlements(d)
             if df_raw.empty:
-                log.warning(f"{d}: no data (holiday or B3 not available)")
+                log.warning(f"{d}: no data — market holiday or data not yet published by B3")
                 skipped += 1
             else:
                 save_raw_settlements(df_raw)
                 log.success(f"{d}: {len(df_raw)} contracts saved")
                 ok += 1
         except Exception as e:
-            log.error(f"{d}: {e}")
+            err = str(e)
+            if "404" in err:
+                log.warning(f"{d}: data not yet available — B3 usually publishes after market close (~18:30 BRT). Try again later or select a prior date.")
+            else:
+                log.error(f"{d}: {err}")
             failed += 1
 
     progress.empty()
