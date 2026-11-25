@@ -1,46 +1,45 @@
 """
-Current SELIC Target Rate — BCB (Banco Central do Brasil)
-===========================================================
+SELIC target and CDI — BCB SGS API
+===================================
 
-Source: BCB's public SGS (Sistema Gerenciador de Séries Temporais) API.
+    Series 432  = SELIC target (meta SELIC), % p.a.
+    Series 4389 = CDI annualised, base 252, % p.a.  ← the rate the DI index compounds at
 
-    Series 432 = SELIC target (meta SELIC) — updated on every COPOM decision.
-    URL: https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json
-    Response: [{"data": "DD/MM/YYYY", "valor": "13.25"}]  ← valor is already % p.a.
-
-The SELIC target is the overnight rate that is currently compounding in the
-DI index.  It is set at each COPOM meeting and does NOT change between meetings.
-It is the correct starting rate for all COPOM pricing calculations.
+Values are fetched AS OF a reference date (last observation on or before it),
+so a historical DI curve is always paired with the rates in force that day.
 """
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import requests
 
-_BCB_SGS_URL = (
-    "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series}/dados/ultimos/{n}"
-    "?formato=json"
+_URL = (
+    "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series}/dados"
+    "?formato=json&dataInicial={start}&dataFinal={end}"
 )
-_SELIC_TARGET_SERIES = 432
+SELIC_TARGET = 432
+CDI_252 = 4389
 
 
-def fetch_selic_target() -> tuple[float, date]:
-    """Fetch the current SELIC target rate from BCB SGS.
-
-    Returns:
-        (rate_decimal, reference_date)  e.g. (0.1325, date(2026, 1, 28))
-    """
-    url = _BCB_SGS_URL.format(series=_SELIC_TARGET_SERIES, n=1)
-    resp = requests.get(url, timeout=10)
+def fetch_sgs_as_of(series: int, ref_date: date, lookback_days: int = 20) -> tuple[float, date]:
+    """Return (value_decimal, observation_date) for the last observation <= ref_date."""
+    start = (ref_date - timedelta(days=lookback_days)).strftime("%d/%m/%Y")
+    end = ref_date.strftime("%d/%m/%Y")
+    resp = requests.get(_URL.format(series=series, start=start, end=end), timeout=15)
     resp.raise_for_status()
     data = resp.json()
-    latest = data[-1]
-    rate_decimal = float(latest["valor"]) / 100.0
-    ref_date = date(
-        int(latest["data"][6:10]),
-        int(latest["data"][3:5]),
-        int(latest["data"][0:2]),
-    )
-    return rate_decimal, ref_date
+    if not data:
+        raise ValueError(f"SGS {series}: no data between {start} and {end}")
+    last = data[-1]
+    d, m, y = last["data"].split("/")
+    return float(last["valor"]) / 100.0, date(int(y), int(m), int(d))
+
+
+def fetch_selic_target(ref_date: date) -> tuple[float, date]:
+    return fetch_sgs_as_of(SELIC_TARGET, ref_date)
+
+
+def fetch_cdi(ref_date: date) -> tuple[float, date]:
+    return fetch_sgs_as_of(CDI_252, ref_date)

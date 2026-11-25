@@ -1,6 +1,5 @@
 """
-COPOM Pricing — What is the DI Curve Pricing per Meeting?
-===========================================================
+COPOM Pricing — meeting-by-meeting SELIC path implied by the DI1 curve
 """
 
 import os
@@ -13,392 +12,333 @@ import streamlit as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from data_pipeline.bcb_meetings import load_meetings, populate_meetings
-from data_pipeline.copom_pricing import build_hypothesis_curve, calculate_copom_pricing
+from data_pipeline.bcb_meetings import load_meetings
+from data_pipeline.copom_pricing import calculate_copom_pricing, hypothesis_curve
 from data_pipeline.di_curve import load_available_dates, load_curve_from_db
-from data_pipeline.selic_rate import fetch_selic_target
+from data_pipeline.selic_rate import fetch_cdi, fetch_selic_target
 
 st.set_page_config(page_title="COPOM Pricing", layout="wide")
 
 CHART_TEMPLATE = "plotly_dark"
-COLOR_MARKET   = "#00C8FF"
-COLOR_HYP      = "#FF9F43"
+COLOR_MARKET = "#00C8FF"
+COLOR_HYP = "#FF9F43"
+COLOR_UP = "#FF6B6B"
+COLOR_DOWN = "#51CF66"
 
 
-def _nearest_di_rate(decision_date_str: str, df_curve: pd.DataFrame, ref_date: date) -> float:
-    """Return the DI spot rate (%) for the contract nearest to the meeting date."""
-    from bizdays import Calendar
-    cal = Calendar.load("ANBIMA")
+def _short(code: str) -> str:
+    return code[3:] if code.startswith("DI1") else code
+
+
+@st.cache_data(ttl=600)
+def _dates() -> list[str]:
+    return load_available_dates()
+
+
+@st.cache_data(ttl=600)
+def _curve(d: str) -> pd.DataFrame:
+    return load_curve_from_db(date.fromisoformat(d))
+
+
+@st.cache_data(ttl=600)
+def _meetings() -> pd.DataFrame:
+    return load_meetings()
+
+
+@st.cache_data(ttl=3600)
+def _sgs(kind: str, d: str):
+    fn = fetch_cdi if kind == "cdi" else fetch_selic_target
     try:
-        d = date.fromisoformat(str(decision_date_str))
-        target_du = cal.bizdays(ref_date, d)
-    except Exception:
-        return float("nan")
-    curve = df_curve.sort_values("du")
-    near = curve[curve["du"] >= target_du]
-    row = near.iloc[0] if not near.empty else curve.iloc[-1]
-    return float(row["rate_252"]) * 100
+        return fn(date.fromisoformat(d))
+    except Exception as e:
+        return None, str(e)
+
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.header("COPOM Pricing")
 
-available_dates = load_available_dates()
-if not available_dates:
-    st.error("No DI curve data found. Run the DI Curve pipeline first.")
+available = _dates()
+if not available:
+    st.error("No DI curve data. Download it in the Update Data page.")
     st.stop()
 
-curve_date = st.sidebar.selectbox("DI Curve date", available_dates, index=0)
+curve_date = st.sidebar.selectbox("DI curve date", available, index=0)
+ref_date = date.fromisoformat(curve_date)
+horizon_y = st.sidebar.slider("Horizon (years)", 0.5, 3.0, 2.0, 0.5)
+max_du = int(252 * horizon_y)
 
-st.sidebar.divider()
-
-# Current SELIC input — pre-filled from shortest contract as proxy
-df_curve = load_curve_from_db(date.fromisoformat(curve_date))
+df_curve = _curve(curve_date)
 if df_curve.empty:
     st.error(f"No curve data for {curve_date}.")
     st.stop()
 
-df_curve["rate_252"] = pd.to_numeric(df_curve["rate_252"], errors="coerce")
-df_curve["du"]       = pd.to_numeric(df_curve["du"], errors="coerce").astype(int)
-
-# Fetch current SELIC target from BCB SGS (series 432)
-_bcb_selic, _bcb_date = None, None
-try:
-    _bcb_selic, _bcb_date = fetch_selic_target()
-except Exception:
-    pass
-
-_default_selic = round(_bcb_selic * 100, 2) if _bcb_selic else round(
-    float(df_curve.sort_values("du").iloc[0]["rate_252"]) * 100, 2
-)
-
-if _bcb_selic:
-    st.sidebar.success(f"SELIC from BCB: **{_bcb_selic*100:.2f}%** (as of {_bcb_date})")
-else:
-    st.sidebar.warning("Could not fetch SELIC from BCB. Using shortest DI contract as proxy.")
-
-selic_input = st.sidebar.number_input(
-    "Current SELIC target (% a.a.)",
-    min_value=0.0,
-    max_value=50.0,
-    value=_default_selic,
-    step=0.25,
-    help=(
-        "SELIC target rate set at the last COPOM meeting. "
-        "This is the overnight rate currently compounding in the DI index. "
-        "Auto-filled from BCB SGS series 432."
-    ),
-)
-selic_rate = selic_input / 100.0
+df_meetings = _meetings()
+if df_meetings.empty:
+    st.error("No COPOM calendar in `bcb_meetings`. Populate it in the Update Data page.")
+    st.stop()
 
 st.sidebar.divider()
-with st.sidebar.expander("Meetings calendar"):
-    st.caption("Load the pre-configured meeting calendar into Supabase.")
-    if st.button("Populate meetings"):
-        populate_meetings()
-        st.success("Done.")
-        st.rerun()
+st.sidebar.subheader(f"Overnight rate on {curve_date}")
 
-# ---------------------------------------------------------------------------
-# Load meetings
-# ---------------------------------------------------------------------------
-ref_date = date.fromisoformat(curve_date)
-df_meetings = load_meetings(from_date=ref_date)
+cdi_bcb, cdi_obs = _sgs("cdi", curve_date)
+selic_bcb, selic_obs = _sgs("selic", curve_date)
 
-if df_meetings.empty:
-    st.title("COPOM Pricing")
-    st.warning(
-        "No meeting calendar found in Supabase. "
-        "Use **Populate meetings** in the sidebar."
+first_mtg_du = None
+_upcoming = df_meetings[df_meetings["effective_date"] > curve_date]
+if not _upcoming.empty:
+    from bizdays import Calendar
+    first_mtg_du = Calendar.load("ANBIMA").bizdays(
+        ref_date, date.fromisoformat(_upcoming["effective_date"].iloc[0])
     )
-    st.stop()
+_c = df_curve.assign(du=pd.to_numeric(df_curve["du"]), rate_252=pd.to_numeric(df_curve["rate_252"]))
+_pre = _c[_c["du"] <= first_mtg_du] if first_mtg_du else _c.iloc[0:0]
+cdi_di = float(_pre.sort_values("du").iloc[0]["rate_252"]) if not _pre.empty else None
 
-# Only meetings whose effective_date is after the curve date
-df_meetings = df_meetings[df_meetings["effective_date"] > curve_date].reset_index(drop=True)
+sources = []
+if cdi_bcb is not None:
+    sources.append(f"BCB CDI — {cdi_bcb * 100:.2f}%")
+if cdi_di is not None:
+    sources.append(f"First DI before 1st meeting — {cdi_di * 100:.3f}%")
+sources.append("Manual")
+
+src = st.sidebar.radio(
+    "CDI compounding today",
+    sources,
+    help=(
+        "The DI index accrues the daily CDI, which runs ~10 bps below the SELIC target. "
+        "BCB CDI = SGS series 4389 as of the curve date. "
+        "First DI = the shortest contract expiring before the next meeting (market-implied CDI)."
+    ),
+)
+if src.startswith("BCB"):
+    cdi0 = cdi_bcb
+elif src.startswith("First DI"):
+    cdi0 = cdi_di
+else:
+    default = (cdi_bcb or cdi_di or 0.10) * 100
+    cdi0 = st.sidebar.number_input("CDI (% a.a.)", 0.0, 50.0, round(default, 2), 0.01) / 100
+
+if selic_bcb is not None:
+    spread = selic_bcb - cdi0
+    st.sidebar.caption(
+        f"SELIC target on {selic_obs}: **{selic_bcb * 100:.2f}%** · "
+        f"spread vs CDI used: **{spread * 1e4:.0f} bps**"
+    )
+else:
+    spread = 0.0
+    st.sidebar.warning(f"Could not fetch SELIC target from BCB ({selic_obs}). Implied SELIC = CDI.")
+if cdi_bcb is None:
+    st.sidebar.warning(f"Could not fetch CDI from BCB ({cdi_obs}).")
 
 # ---------------------------------------------------------------------------
-# Calculate implied pricing
+# Pricing
 # ---------------------------------------------------------------------------
-df_pricing = calculate_copom_pricing(df_curve, df_meetings, ref_date, selic_rate)
+res = calculate_copom_pricing(df_curve, df_meetings, ref_date, cdi0, max_du=max_du)
+mt, ct = res.meetings, res.contracts
 
-# ---------------------------------------------------------------------------
-# Page header
-# ---------------------------------------------------------------------------
 st.title("COPOM Pricing")
 st.caption(
-    f"DI curve: **{curve_date}** · "
-    f"SELIC: **{selic_input:.2f}%** · "
-    f"Meetings priced: **{len(df_pricing)}**"
+    f"DI curve **{curve_date}** · CDI **{cdi0 * 100:.3f}%** · "
+    f"horizon **{horizon_y:g}y** · meetings priced **{len(mt)}**"
 )
 
-# ---------------------------------------------------------------------------
-# Section 1 — DI curve + COPOM pricing table (2 years horizon)
-# ---------------------------------------------------------------------------
-st.subheader("DI Curve — COPOM pricing")
-
-# Limit to ~2 years
-_2Y_DU = int(252 * 2)
-df_2y = (
-    df_curve[df_curve["du"] <= _2Y_DU]
-    .sort_values("du")
-    .reset_index(drop=True)
-    .copy()
-)
-df_2y["rate_252"] = pd.to_numeric(df_2y["rate_252"], errors="coerce")
-
-# Map each COPOM meeting to the DI contract whose period (prev_du, du] contains it.
-# That contract's rate already "prices in" the meeting.
-def _build_meeting_map(curve: pd.DataFrame, pricing: pd.DataFrame) -> dict:
-    """Return {contract_code: row_of_pricing} for meetings within the 2Y horizon.
-
-    The meeting is assigned to the contract that expires immediately BEFORE
-    the meeting's effective date — i.e. one row above where the rate change
-    actually kicks in.
-    """
-    mapping = {}
-    sorted_c = curve.sort_values("du").reset_index(drop=True)
-    for _, mtg in pricing.iterrows():
-        eff_du = int(mtg["effective_du"])
-        prev_code = None
-        prev_du = 0
-        for idx, c_row in sorted_c.iterrows():
-            curr_du = int(c_row["du"])
-            if prev_du < eff_du <= curr_du:
-                # assign to the contract just BEFORE this period
-                if prev_code is not None:
-                    mapping[prev_code] = mtg
-                break
-            prev_code = c_row["contract_code"]
-            prev_du = curr_du
-    return mapping
-
-meeting_map = _build_meeting_map(df_2y, df_pricing) if not df_pricing.empty else {}
-
-# Build display rows
-rows = []
-for _, c_row in df_2y.iterrows():
-    code  = str(c_row["contract_code"])
-    mtg   = meeting_map.get(code)
-    rows.append({
-        "Contract":           code[3:] if code.startswith("DI1") else code,
-        "Maturity":           str(c_row["expiry_date"]),
-        "Rate (%)":           round(float(c_row["rate_252"]) * 100, 4),
-        "│":                  "",   # visual separator column
-        "COPOM Effective":    str(mtg["effective_date"]) if mtg is not None else "",
-        "Priced (bps)":       float(mtg["change_bps"])  if mtg is not None else None,
-        "CDI post-dec. (%)":  float(mtg["rate_after"])  if mtg is not None else None,
-    })
-
-tbl = pd.DataFrame(rows)
-
-# --- Styler ---
-has_meeting = tbl["COPOM Effective"] != ""
-
-def _style_table(df):
-    styles = pd.DataFrame("", index=df.index, columns=df.columns)
-
-    # Highlight rows with a COPOM meeting
-    for col in df.columns:
-        styles.loc[has_meeting, col] = "background-color: rgba(0,200,255,0.07)"
-
-    # Separator column — thin, muted
-    styles["│"] = "color: #444444; width: 8px"
-
-    # Priced bps colour
-    for i, val in df["Priced (bps)"].items():
-        if pd.notna(val) and val != 0:
-            color = "#51CF66" if val < 0 else "#FF6B6B"
-            styles.loc[i, "Priced (bps)"] = (
-                styles.loc[i, "Priced (bps)"] + f"; color: {color}; font-weight: bold"
-            )
-
-    return styles
-
-fmt = {
-    "Rate (%)":          "{:.4f}",
-    "Priced (bps)":      "{:+.1f}",
-    "CDI post-dec. (%)": "{:.4f}",
-}
-
-st.dataframe(
-    tbl.style.apply(_style_table, axis=None).format(fmt, na_rep=""),
-    use_container_width=True,
-    height=min(60 + len(tbl) * 35, 700),
-    column_config={
-        "│": st.column_config.TextColumn(width="small"),
-        "COPOM Effective": st.column_config.TextColumn(width="medium"),
-        "Priced (bps)":    st.column_config.NumberColumn(format="%+.1f bps"),
-        "CDI post-dec. (%)": st.column_config.NumberColumn(format="%.4f %%"),
-    },
-)
-st.caption(
-    "**CDI post-dec.**: implied SELIC rate after the COPOM decision, "
-    "calibrated so that the compounded daily rate exactly reproduces the DI contract price."
-)
-
-
-
-# ---------------------------------------------------------------------------
-# Section 2 — Implied SELIC path
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("Implied SELIC path")
-
-if not df_pricing.empty:
-    # Build step chart: SELIC level before and after each meeting
-    path_dates  = [curve_date] + list(df_pricing["effective_date"])
-    path_rates  = [selic_input] + list(df_pricing["rate_after"])
-
-    fig_path = go.Figure(
-        go.Scatter(
-            x=path_dates,
-            y=path_rates,
-            mode="lines+markers",
-            line=dict(color=COLOR_MARKET, width=2.5, shape="hv"),  # step chart
-            marker=dict(size=8, color=COLOR_MARKET),
-            name="Market implied",
-            hovertemplate="<b>%{x}</b><br>SELIC: %{y:.4f}%<extra></extra>",
-        )
+if mt.empty:
+    st.warning(
+        "No COPOM meeting falls inside the curve horizon. "
+        "Check that `bcb_meetings` has dates after the curve date."
     )
-    fig_path.add_hline(
-        y=selic_input,
-        line_dash="dot",
-        line_color="gray",
-        annotation_text=f"Current SELIC {selic_input:.2f}%",
-        annotation_position="top left",
-    )
-    fig_path.update_layout(
-        title="Market-implied SELIC path",
-        xaxis_title="Effective date",
-        yaxis_title="SELIC (% a.a.)",
-        template=CHART_TEMPLATE,
-        height=350,
-        margin=dict(t=50, b=40),
-    )
-    st.plotly_chart(fig_path, use_container_width=True)
-
-# ---------------------------------------------------------------------------
-# Section 3 — Hypothesis
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("Hypothesis — your rate path vs. market")
-
-st.caption(
-    "Edit the expected change (bps) for each meeting below. "
-    "The chart compares the resulting implied DI curve with the market curve."
-)
-
-if df_pricing.empty:
-    st.info("No meetings within curve horizon to build a hypothesis.")
     st.stop()
 
-# Build editable hypothesis table
-hyp_df = df_pricing[["decision_date", "effective_date", "rate_before", "change_bps"]].copy()
-hyp_df = hyp_df.rename(columns={
-    "decision_date":  "Decision date",
-    "effective_date": "Effective date",
-    "rate_before":    "Rate before (%)",
-    "change_bps":     "Market Δ (bps)",
-})
-hyp_df["Your Δ (bps)"] = hyp_df["Market Δ (bps)"]  # default = market
+mt = mt.assign(selic_after=mt["cdi_after"] + spread)
 
+# Headline metrics
+c1, c2, c3, c4 = st.columns(4)
+nxt = mt.iloc[0]
+c1.metric("Next meeting", nxt["decision_date"], f"{nxt['change_bps']:+.1f} bps", delta_color="off")
+c2.metric("Implied SELIC after next", f"{nxt['selic_after'] * 100:.2f}%")
+within_12m = mt[mt["effective_du"] <= 252]
+c3.metric("Priced next 12M", f"{within_12m['change_bps'].sum():+.0f} bps" if not within_12m.empty else "—")
+c4.metric(f"Priced to {mt['decision_date'].iloc[-1]}", f"{mt['cumulative_bps'].iloc[-1]:+.0f} bps")
+
+# ---------------------------------------------------------------------------
+# 1 — Per-meeting table
+# ---------------------------------------------------------------------------
+st.subheader("Priced per meeting")
+
+tbl = pd.DataFrame({
+    "Decision": mt["decision_date"],
+    "Effective": mt["effective_date"],
+    "DU": mt["effective_du"],
+    "CDI before (%)": mt["cdi_before"] * 100,
+    "CDI after (%)": mt["cdi_after"] * 100,
+    "Implied SELIC (%)": mt["selic_after"] * 100,
+    "Δ (bps)": mt["change_bps"],
+    "Cumulative (bps)": mt["cumulative_bps"],
+    "Probabilities (25 bps grid)": mt["probabilities"],
+    "Fitted on": mt["anchor"] + mt["shared"].map({True: "  (shared)", False: ""}),
+})
+
+
+def _sign_color(v):
+    if pd.isna(v) or abs(v) < 0.05:
+        return ""
+    return f"color: {COLOR_UP if v > 0 else COLOR_DOWN}; font-weight: bold"
+
+
+st.dataframe(
+    tbl.style.format({
+        "CDI before (%)": "{:.3f}", "CDI after (%)": "{:.3f}", "Implied SELIC (%)": "{:.2f}",
+        "Δ (bps)": "{:+.1f}", "Cumulative (bps)": "{:+.1f}",
+    }).map(_sign_color, subset=["Δ (bps)", "Cumulative (bps)"]),
+    hide_index=True,
+    width="stretch",
+)
+st.caption(
+    "Each meeting is fitted to the DI contracts expiring between it and the next meeting, "
+    "given the path already solved for earlier meetings. "
+    "**(shared)**: no contract expires between those meetings, so the move is split equally. "
+    "Implied SELIC = CDI + (SELIC target − CDI) spread on the curve date."
+)
+
+# ---------------------------------------------------------------------------
+# 2 — Charts
+# ---------------------------------------------------------------------------
+g1, g2 = st.columns(2)
+
+with g1:
+    fig = go.Figure(go.Bar(
+        x=mt["decision_date"],
+        y=mt["change_bps"],
+        marker_color=[COLOR_UP if v > 0 else COLOR_DOWN for v in mt["change_bps"]],
+        text=[f"{v:+.0f}" for v in mt["change_bps"]],
+        textposition="outside",
+        hovertemplate="<b>%{x}</b><br>%{y:+.1f} bps<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Priced change per meeting", xaxis_title="Decision date", yaxis_title="bps",
+        template=CHART_TEMPLATE, height=360, margin=dict(t=50, b=40), xaxis_type="category",
+    )
+    st.plotly_chart(fig, width="stretch")
+
+with g2:
+    selic0 = cdi0 + spread
+    fig = go.Figure(go.Scatter(
+        x=[curve_date] + mt["effective_date"].tolist(),
+        y=[selic0 * 100] + (mt["selic_after"] * 100).tolist(),
+        mode="lines+markers",
+        line=dict(color=COLOR_MARKET, width=2.5, shape="hv"),
+        marker=dict(size=7),
+        hovertemplate="<b>%{x}</b><br>SELIC %{y:.2f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Market-implied SELIC path", xaxis_title="Effective date", yaxis_title="% a.a.",
+        template=CHART_TEMPLATE, height=360, margin=dict(t=50, b=40),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+# ---------------------------------------------------------------------------
+# 3 — Curve & meetings timeline
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("DI curve and meetings timeline")
+
+rows = [{
+    "_du": int(r.du), "_ord": 1, "Item": _short(r.contract_code), "Date": r.expiry_date,
+    "DU": int(r.du), "DI market (%)": r.rate_252 * 100, "DI model (%)": r.model_rate * 100,
+    "Fit error (bps)": r.error_bps, "COPOM Δ (bps)": None, "CDI after (%)": None,
+} for r in ct.itertuples()]
+rows += [{
+    "_du": int(r.effective_du), "_ord": 0, "Item": f"COPOM {r.decision_date}", "Date": r.effective_date,
+    "DU": int(r.effective_du), "DI market (%)": None, "DI model (%)": None,
+    "Fit error (bps)": None, "COPOM Δ (bps)": r.change_bps, "CDI after (%)": r.cdi_after * 100,
+} for r in mt.itertuples()]
+# A meeting effective on a contract's expiry day sits after that contract
+timeline = pd.DataFrame(rows).sort_values(["_du", "_ord"], ascending=[True, False])
+timeline = timeline.drop(columns=["_du", "_ord"]).reset_index(drop=True)
+is_mtg = timeline["Item"].str.startswith("COPOM")
+
+
+def _row_style(df):
+    s = pd.DataFrame("", index=df.index, columns=df.columns)
+    s.loc[is_mtg, :] = "background-color: rgba(0,200,255,0.10)"
+    for i, v in df["COPOM Δ (bps)"].items():
+        if pd.notna(v):
+            s.loc[i, "COPOM Δ (bps)"] += "; " + _sign_color(v)
+    return s
+
+
+st.dataframe(
+    timeline.style.apply(_row_style, axis=None).format({
+        "DI market (%)": "{:.3f}", "DI model (%)": "{:.3f}", "Fit error (bps)": "{:+.2f}",
+        "COPOM Δ (bps)": "{:+.1f}", "CDI after (%)": "{:.3f}",
+    }, na_rep=""),
+    hide_index=True,
+    width="stretch",
+    height=min(40 + 35 * len(timeline), 720),
+)
+st.caption(
+    "**DI model**: contract rate recomputed by compounding the implied CDI path. "
+    "**Fit error** = model − market; large errors flag noisy contracts or a wrong calendar."
+)
+
+# ---------------------------------------------------------------------------
+# 4 — Hypothesis
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Your scenario vs. market")
+
+hyp_in = pd.DataFrame({
+    "Decision": mt["decision_date"],
+    "Market Δ (bps)": mt["change_bps"].round(1),
+    "Your Δ (bps)": (mt["change_bps"] / 25).round() * 25,
+})
 edited = st.data_editor(
-    hyp_df,
-    column_config={
-        "Decision date":  st.column_config.TextColumn(disabled=True),
-        "Effective date": st.column_config.TextColumn(disabled=True),
-        "Rate before (%)": st.column_config.NumberColumn(disabled=True, format="%.4f"),
-        "Market Δ (bps)": st.column_config.NumberColumn(disabled=True, format="%+.1f"),
-        "Your Δ (bps)": st.column_config.NumberColumn(
-            help="Enter your expected SELIC change in basis points (e.g. -25, 0, +50).",
-            step=25.0,
-            format="%+.0f",
-        ),
-    },
-    use_container_width=True,
+    hyp_in,
     hide_index=True,
     num_rows="fixed",
+    width="stretch",
+    column_config={
+        "Decision": st.column_config.TextColumn(disabled=True),
+        "Market Δ (bps)": st.column_config.NumberColumn(disabled=True, format="%+.1f"),
+        "Your Δ (bps)": st.column_config.NumberColumn(step=25.0, format="%+.0f"),
+    },
 )
 
-# Map decision_date → user change
-hypothesis = {
-    str(row["Decision date"]): float(row["Your Δ (bps)"])
-    for _, row in edited.iterrows()
-}
+hyp = hypothesis_curve(ct, mt["effective_du"].tolist(), cdi0, edited["Your Δ (bps)"].fillna(0).tolist())
 
-# Build hypothesis curve
-df_hyp = build_hypothesis_curve(df_curve, df_meetings, ref_date, selic_rate, hypothesis)
-df_curve["rate_pct"] = df_curve["rate_252"] * 100
-df_hyp["rate_pct"]   = df_hyp["rate_252"]  * 100
+h1, h2 = st.columns(2)
+with h1:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hyp["contract_code"].map(_short), y=hyp["rate_252"] * 100, name=f"Market {curve_date}",
+        mode="lines+markers", line=dict(color=COLOR_MARKET, width=2.5),
+    ))
+    fig.add_trace(go.Scatter(
+        x=hyp["contract_code"].map(_short), y=hyp["hyp_rate"] * 100, name="Your scenario",
+        mode="lines+markers", line=dict(color=COLOR_HYP, width=2.5, dash="dash"),
+    ))
+    fig.update_layout(
+        title="DI curve — market vs. scenario", xaxis_title="Contract", yaxis_title="% a.a.",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template=CHART_TEMPLATE, height=380, margin=dict(t=60, b=40),
+    )
+    st.plotly_chart(fig, width="stretch")
 
-def _short(code: str) -> str:
-    return code[3:] if code.startswith("DI1") else code
+with h2:
+    fig = go.Figure(go.Bar(
+        x=hyp["contract_code"].map(_short), y=hyp["diff_bps"],
+        marker_color=[COLOR_UP if v > 0 else COLOR_DOWN for v in hyp["diff_bps"]],
+        hovertemplate="<b>%{x}</b><br>%{y:+.1f} bps<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Scenario − market (bps)", xaxis_title="Contract", yaxis_title="bps",
+        template=CHART_TEMPLATE, height=380, margin=dict(t=60, b=40),
+    )
+    st.plotly_chart(fig, width="stretch")
 
-fig_hyp = go.Figure()
-
-fig_hyp.add_trace(go.Scatter(
-    x=df_curve["contract_code"].map(_short),
-    y=df_curve["rate_pct"],
-    mode="lines+markers",
-    name=f"Market ({curve_date})",
-    line=dict(color=COLOR_MARKET, width=2.5),
-    marker=dict(size=6),
-    hovertemplate="<b>%{x}</b><br>DU: %{customdata}<br>Rate: %{y:.3f}%<extra></extra>",
-    customdata=df_curve["du"],
-))
-
-fig_hyp.add_trace(go.Scatter(
-    x=df_hyp["contract_code"].map(_short),
-    y=df_hyp["rate_pct"],
-    mode="lines+markers",
-    name="Your hypothesis",
-    line=dict(color=COLOR_HYP, width=2.5, dash="dash"),
-    marker=dict(size=6),
-    hovertemplate="<b>%{x}</b><br>DU: %{customdata}<br>Rate: %{y:.3f}%<extra></extra>",
-    customdata=df_hyp["du"],
-))
-
-fig_hyp.update_layout(
-    title="Market DI curve vs. your hypothesis",
-    xaxis_title="Contract",
-    yaxis_title="Spot Rate (% a.a.)",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    template=CHART_TEMPLATE,
-    height=420,
-    margin=dict(t=60, b=40),
+st.caption(
+    "Positive = your scenario implies a higher rate than the market for that contract "
+    "(you would pay — be 'tomado' in — DI there)."
 )
-st.plotly_chart(fig_hyp, use_container_width=True)
-
-# Show hypothesis implied SELIC path
-hyp_rates = [selic_input]
-cur = selic_rate
-for _, row in edited.iterrows():
-    cur += float(row["Your Δ (bps)"]) / 10_000.0
-    hyp_rates.append(round(cur * 100, 4))
-
-hyp_dates = [curve_date] + list(edited["Effective date"])
-
-fig_hyp_path = go.Figure()
-fig_hyp_path.add_trace(go.Scatter(
-    x=path_dates, y=path_rates,
-    mode="lines+markers", name="Market implied",
-    line=dict(color=COLOR_MARKET, width=2, shape="hv"),
-    marker=dict(size=7),
-))
-fig_hyp_path.add_trace(go.Scatter(
-    x=hyp_dates, y=hyp_rates,
-    mode="lines+markers", name="Your hypothesis",
-    line=dict(color=COLOR_HYP, width=2, dash="dash", shape="hv"),
-    marker=dict(size=7),
-))
-fig_hyp_path.update_layout(
-    title="SELIC path — market vs. hypothesis",
-    xaxis_title="Effective date",
-    yaxis_title="SELIC (% a.a.)",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    template=CHART_TEMPLATE,
-    height=320,
-    margin=dict(t=60, b=40),
-)
-st.plotly_chart(fig_hyp_path, use_container_width=True)
