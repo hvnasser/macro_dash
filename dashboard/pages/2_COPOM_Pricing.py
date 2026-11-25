@@ -117,8 +117,16 @@ if src.startswith("BCB"):
 elif src.startswith("First DI"):
     cdi0 = cdi_di
 else:
-    default = (cdi_bcb or cdi_di or 0.10) * 100
-    cdi0 = st.sidebar.number_input("CDI (% a.a.)", 0.0, 50.0, round(default, 2), 0.01) / 100
+    default = cdi_bcb or cdi_di or (selic_bcb - 0.001 if selic_bcb is not None else None)
+    manual = st.sidebar.number_input(
+        "CDI (% a.a.)", 0.0, 50.0,
+        value=round(default * 100, 2) if default is not None else None,
+        step=0.01, placeholder="e.g. 14.90",
+    )
+    if manual is None:
+        st.warning("BCB is unreachable: enter today's CDI in the sidebar to price the meetings.")
+        st.stop()
+    cdi0 = manual / 100
 
 if selic_bcb is not None:
     spread = selic_bcb - cdi0
