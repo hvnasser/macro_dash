@@ -186,12 +186,13 @@ st.caption(
 # Quick metrics
 m1, m2, m3, m4, m5 = st.columns(5)
 def _metric(col, label, df, du_max=None, du_min=None, idx=None):
-    sub = df
-    if du_max:
-        sub = df[df["du"] <= du_max]
-    if du_min:
-        sub = df[df["du"] >= du_min]
-    row = sub.iloc[idx if idx is not None else -1] if not sub.empty else df.iloc[0]
+    mask = pd.Series(True, index=df.index)
+    if du_min is not None:
+        mask &= df["du"] >= du_min
+    if du_max is not None:
+        mask &= df["du"] <= du_max
+    sub = df[mask]
+    row = sub.iloc[idx if idx is not None else 0] if not sub.empty else df.iloc[0]
     col.metric(label, f"{row['rate_pct']:.2f}%", help=f"{row['contract_code']} · DU {row['du']}")
 
 _metric(m1, "Short (≤3M)",  df_main, du_max=63)
