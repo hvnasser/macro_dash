@@ -8,6 +8,7 @@ import os
 import sys
 from datetime import date, timedelta
 
+import pandas as pd
 import streamlit as st
 from bizdays import Calendar
 
@@ -230,3 +231,20 @@ try:
     )
 except Exception as e:
     st.error(f"Could not fetch DB status: {e}")
+
+st.subheader("Automated runs (GitHub Actions, 21:05 BRT)")
+try:
+    runs = (
+        client.table("pipeline_runs")
+        .select("started_at, trigger, status, saved_dates, rebuilt_dates, missing_dates, message")
+        .order("started_at", desc=True).limit(15).execute().data
+    )
+    if not runs:
+        st.info("No automated runs logged yet.")
+    else:
+        last = runs[0]
+        icon = {"ok": "✅", "warning": "⚠️", "error": "❌"}.get(last["status"], "")
+        st.markdown(f"Last run: **{last['started_at'][:16].replace('T', ' ')} UTC** — {icon} {last['status']}")
+        st.dataframe(pd.DataFrame(runs), hide_index=True, width="stretch")
+except Exception as e:
+    st.info(f"Run log unavailable — create `pipeline_runs` with supabase/automation.sql. ({e})")

@@ -61,7 +61,9 @@ def fetch_di_settlements(ref_date: date) -> pd.DataFrame:
     """
     pl_df = yd.futures(date=ref_date, contract_code="DI1")
 
-    if pl_df.is_empty():
+    # For today's date before B3 publishes, PYield falls back to intraday quotes,
+    # which have no settlement columns — treat as "not published yet".
+    if pl_df.is_empty() or not {"SettlementPrice", "SettlementRate"} <= set(pl_df.columns):
         return pd.DataFrame()
 
     # PYield returns a Polars DataFrame — convert to pandas

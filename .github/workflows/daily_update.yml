@@ -1,0 +1,35 @@
+name: Daily DI update
+
+# Primary trigger: Supabase pg_cron calls workflow_dispatch at 21:05 and 07:05 BRT
+# (see supabase/automation.sql) — exact timing, unlike GitHub's scheduler.
+# The schedules below are a backup in case that call fails. Runs are idempotent,
+# so duplicate triggers are harmless no-ops.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 0 * * 2-6"   # 21:17 BRT, Mon–Fri
+    - cron: "17 10 * * 2-6"  # 07:17 BRT, Tue–Sat (catch-up for late B3 files)
+
+concurrency:
+  group: daily-di-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Download B3 settlements and build curves
+        run: uv run python scripts/daily_update.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
