@@ -13,7 +13,7 @@ import streamlit as st
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from data_pipeline.bcb_meetings import load_meetings
-from data_pipeline.copom_pricing import calculate_copom_pricing, hypothesis_curve
+from data_pipeline.copom_pricing import DEFAULT_SMOOTHNESS, calculate_copom_pricing, hypothesis_curve
 from data_pipeline.di_curve import load_available_dates, load_curve_from_db
 from data_pipeline.selic_rate import fetch_cdi, fetch_selic_target
 
@@ -67,6 +67,14 @@ if not available:
 curve_date = st.sidebar.selectbox("DI curve date", available, index=0)
 ref_date = date.fromisoformat(curve_date)
 horizon_y = st.sidebar.slider("Horizon (years)", 0.5, 3.0, 2.0, 0.5)
+smoothness = st.sidebar.slider(
+    "Smoothness", 0.0, 1.0, DEFAULT_SMOOTHNESS, 0.05,
+    help=(
+        "Penalty on jumps between consecutive meeting changes. "
+        "0 = pure least-squares fit (noisier, follows illiquid contracts). "
+        "0.2 matched Bloomberg within ~1 bp on 2026-11-24."
+    ),
+)
 max_du = int(252 * horizon_y)
 
 df_curve = _curve(curve_date)
@@ -143,7 +151,7 @@ if cdi_bcb is None:
 # ---------------------------------------------------------------------------
 # Pricing
 # ---------------------------------------------------------------------------
-res = calculate_copom_pricing(df_curve, df_meetings, ref_date, cdi0, max_du=max_du)
+res = calculate_copom_pricing(df_curve, df_meetings, ref_date, cdi0, max_du=max_du, smoothness=smoothness)
 mt, ct = res.meetings, res.contracts
 
 st.title("COPOM Pricing")
@@ -185,7 +193,6 @@ tbl = pd.DataFrame({
     "Δ (bps)": mt["change_bps"],
     "Cumulative (bps)": mt["cumulative_bps"],
     "Probabilities (25 bps grid)": mt["probabilities"],
-    "Fitted on": mt["anchor"] + mt["shared"].map({True: "  (shared)", False: ""}),
 })
 
 
@@ -204,9 +211,8 @@ st.dataframe(
     width="stretch",
 )
 st.caption(
-    "Each meeting is fitted to the DI contracts expiring between it and the next meeting, "
-    "given the path already solved for earlier meetings. "
-    "**(shared)**: no contract expires between those meetings, so the move is split equally. "
+    "All meetings are fitted jointly to every DI contract in the horizon (least squares), "
+    "with a small penalty on jumps between consecutive meeting changes — see *Smoothness* in the sidebar. "
     "Implied SELIC = CDI + (SELIC target − CDI) spread on the curve date."
 )
 
