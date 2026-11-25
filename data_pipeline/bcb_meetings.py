@@ -48,15 +48,24 @@ _KNOWN_DECISION_DATES: list[date] = [
     date(2025, 9, 17),
     date(2025, 11, 5),
     date(2025, 12, 10),
-    # 2026 — verify against official BCB calendar at bcb.gov.br
+    # 2026
     date(2026, 1, 28),
     date(2026, 3, 18),
     date(2026, 4, 29),
     date(2026, 6, 17),
-    date(2026, 7, 29),
+    date(2026, 8, 5),
     date(2026, 9, 16),
     date(2026, 11, 4),
     date(2026, 12, 9),
+    # 2027 (published by BCB in June 2026)
+    date(2027, 1, 27),
+    date(2027, 3, 17),
+    date(2027, 4, 28),
+    date(2027, 6, 16),
+    date(2027, 8, 4),
+    date(2027, 9, 22),
+    date(2027, 10, 27),
+    date(2027, 12, 8),
 ]
 
 
@@ -67,14 +76,24 @@ def _build_records() -> list[dict]:
     ]
 
 
-def populate_meetings() -> None:
-    """Insert all known COPOM meeting dates into Supabase.
+def populate_meetings() -> tuple[int, list[str]]:
+    """Sync `bcb_meetings` with the official calendar above.
 
-    Safe to re-run — existing rows are never overwritten (first snapshot wins).
+    Inserts missing dates and deletes stored dates that are not in the official
+    list (e.g. a meeting that was entered on the wrong day).
+    Returns (number of official dates, list of deleted dates).
     """
     records = _build_records()
     upsert_records("bcb_meetings", records, conflict_columns=["decision_date"])
-    print(f"[BCB Meetings] {len(records)} meetings upserted to Supabase.")
+
+    official = {r["decision_date"] for r in records}
+    client = get_client()
+    stored = {r["decision_date"] for r in client.table("bcb_meetings").select("decision_date").execute().data}
+    stale = sorted(stored - official)
+    if stale:
+        client.table("bcb_meetings").delete().in_("decision_date", stale).execute()
+    print(f"[BCB Meetings] {len(records)} official meetings synced; removed {stale or 'none'}.")
+    return len(records), stale
 
 
 def load_meetings(

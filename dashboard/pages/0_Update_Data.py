@@ -8,7 +8,6 @@ import os
 import sys
 from datetime import date, timedelta
 
-import pandas as pd
 import streamlit as st
 from bizdays import Calendar
 
@@ -18,7 +17,6 @@ from data_pipeline.bcb_meetings import populate_meetings
 from data_pipeline.di_curve import (
     fetch_di_settlements,
     recalculate_curve_from_db,
-    run_pipeline,
     save_raw_settlements,
     load_available_dates,
 )
@@ -175,12 +173,16 @@ st.divider()
 # Section 3 — BCB Meeting Calendar
 # ---------------------------------------------------------------------------
 st.subheader("③ BCB / COPOM Meeting Calendar  (`bcb_meetings`)")
-st.caption("Load the pre-configured 2025–2026 COPOM decision dates into Supabase.")
+st.caption(
+    "Sync Supabase with the official 2025–2027 COPOM decision dates: "
+    "adds missing dates and removes dates that are not in the official calendar."
+)
 
-if st.button("📅 Populate meetings calendar"):
+if st.button("📅 Sync meetings calendar"):
     try:
-        populate_meetings()
-        st.success("Meeting calendar saved to Supabase.")
+        n, removed = populate_meetings()
+        st.cache_data.clear()
+        st.success(f"{n} official meetings synced." + (f" Removed: {', '.join(removed)}" if removed else ""))
     except Exception as e:
         st.error(str(e))
 
