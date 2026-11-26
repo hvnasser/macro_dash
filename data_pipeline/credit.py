@@ -5,7 +5,8 @@ Brazil credit data — BCB SGS monthly series
 SOURCE
 ------
 BCB "Estatísticas monetárias e de crédito" (Nota de crédito), via the public
-SGS API:  https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados?formato=json
+SGS API:  https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados?formato=json&dataInicial=01/01/2000
+(without a start date BCB answers some long series, e.g. IPCA, with an empty 304)
 Every code below was checked against the series name in BCB's SGS metadata.
 
 STORAGE (append-only, revisions preserved)
@@ -18,6 +19,7 @@ the most recently collected value for each (series_code, ref_date).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,7 +30,7 @@ from bizdays import Calendar
 from utils.db import _clean_records, get_client
 
 _CAL = Calendar.load("ANBIMA")
-_SGS_URL = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados?formato=json"
+_SGS_URL = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados?formato=json&dataInicial=01/01/2000"
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,23 @@ CREDIT_SERIES: dict[str, Series] = {s.name: s for s in [
     Series(21083, "npl_pj", "%"),
     Series(21084, "npl_pf", "%"),
     Series(21003, "arrears_total", "%"),
+    # NPL on free (non-earmarked) credit by product, %
+    Series(21112, "npl_free_pf", "%"),
+    Series(21121, "npl_free_pf_vehicles", "%"),
+    Series(21129, "npl_free_pf_card", "%"),
+    Series(21119, "npl_free_pf_payroll", "%"),
+    Series(21114, "npl_free_pf_personal", "%"),
+    Series(21118, "npl_free_pf_payroll_inss", "%"),
+    Series(21117, "npl_free_pf_payroll_public", "%"),
+    Series(21116, "npl_free_pf_payroll_private", "%"),
+    Series(21086, "npl_free_pj", "%"),
+    Series(21096, "npl_free_pj_vehicles", "%"),
+    Series(21093, "npl_free_pj_wc", "%"),
+    Series(21106, "npl_free_pj_card", "%"),
+    Series(21087, "npl_free_pj_receivables", "%"),
+    Series(21091, "npl_free_pj_wc_long", "%"),
+    Series(21090, "npl_free_pj_wc_short", "%"),
+    Series(21092, "npl_free_pj_wc_revolving", "%"),
     # Households, % of income
     Series(29037, "hh_indebtedness", "% income 12m"),
     Series(29034, "hh_income_commitment", "% income, sa"),
@@ -87,10 +106,20 @@ _BY_CODE = {s.code: s.name for s in CREDIT_SERIES.values()}
 # Download & store
 # ---------------------------------------------------------------------------
 
-def fetch_sgs(code: int) -> pd.DataFrame:
-    resp = requests.get(_SGS_URL.format(code=code), timeout=60)
-    resp.raise_for_status()
-    df = pd.DataFrame(resp.json())
+def fetch_sgs(code: int, attempts: int = 4) -> pd.DataFrame:
+    """Full history of one SGS series. Retries: BCB intermittently answers with an
+    HTML error page instead of JSON, especially under several quick requests."""
+    for i in range(attempts):
+        try:
+            resp = requests.get(_SGS_URL.format(code=code), timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except (requests.RequestException, ValueError):
+            if i == attempts - 1:
+                raise
+            time.sleep(2 ** (i + 1))
+    df = pd.DataFrame(data)
     if df.empty:
         return pd.DataFrame(columns=["ref_date", "value"])
     df["ref_date"] = pd.to_datetime(df["data"], format="%d/%m/%Y").dt.date.astype(str)

@@ -195,7 +195,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.subheader("④ Credit data — BCB monthly  (`bcb_series`)")
 st.caption(
-    f"Downloads the full history of {len(CREDIT_SERIES)} BCB credit series and stores new months "
+    f"Downloads {len(CREDIT_SERIES)} BCB credit series (history since 2000) and stores new months "
     "and revisions (existing values are never overwritten). BCB publishes credit data "
     "around the end of each month."
 )

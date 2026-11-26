@@ -17,6 +17,7 @@ st.set_page_config(page_title="Brazil Credit", layout="wide")
 
 TEMPLATE = "plotly_dark"
 C1, C2, C3 = "#00C8FF", "#FF9F43", "#A0A0A0"
+C4, C5 = "#51CF66", "#CC5DE8"
 
 
 @st.cache_data(ttl=3600)
@@ -48,15 +49,17 @@ st.sidebar.caption(
 # Chart helpers
 # ---------------------------------------------------------------------------
 def chart(title: str, subtitle: str, lines: dict, y2: dict | None = None, zero: bool = False,
-          since: pd.Timestamp | None = None, y_title: str = "", y2_title: str = ""):
+          since: pd.Timestamp | None = None, y_title: str = "", y2_title: str = "",
+          total: str | None = None):
+    """`total`: name of the series drawn as a thick gray reference line."""
     since = since or start
     fig = go.Figure()
-    colors = iter([C1, C2, C3])
+    colors = iter([C1, C2, C4, C5, C3])
     for name, s in lines.items():
         s = s.dropna()
         s = s[s.index >= since]
-        fig.add_trace(go.Scatter(x=s.index, y=s.values, name=name, mode="lines",
-                                 line=dict(color=next(colors), width=2)))
+        line = dict(color=C3, width=3.5) if name == total else dict(color=next(colors), width=2)
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, name=name, mode="lines", line=line))
     for name, s in (y2 or {}).items():
         s = s.dropna()
         s = s[s.index >= since]
@@ -223,6 +226,47 @@ with a:
     seasonal_chart("15 · Delinquency — corporates", w["npl_pj"], year)
 with b:
     seasonal_chart("16 · Delinquency — households", w["npl_pf"], year)
+
+st.markdown("##### NPL by product — non-earmarked credit")
+st.caption("% of credit over 90 days late, seasonally adjusted (STL). Gray = segment total.")
+
+
+def _npl_sa(cols: dict) -> dict:
+    return {label: cr.seasonal_adjust(w[col]) for label, col in cols.items()}
+
+
+a, b = st.columns(2)
+with a:
+    chart("19 · Households — by product", "NPL, %, SA", _npl_sa({
+        "Vehicles": "npl_free_pf_vehicles",
+        "Credit card": "npl_free_pf_card",
+        "Payroll-deductible": "npl_free_pf_payroll",
+        "Personal (non-payroll)": "npl_free_pf_personal",
+        "Households total": "npl_free_pf",
+    }), total="Households total")
+with b:
+    chart("20 · Households — payroll-deductible by borrower", "NPL, %, SA", _npl_sa({
+        "INSS retirees": "npl_free_pf_payroll_inss",
+        "Public servants": "npl_free_pf_payroll_public",
+        "Private-sector workers": "npl_free_pf_payroll_private",
+        "Payroll total": "npl_free_pf_payroll",
+    }), total="Payroll total")
+a, b = st.columns(2)
+with a:
+    chart("21 · Companies — by product", "NPL, %, SA", _npl_sa({
+        "Vehicles": "npl_free_pj_vehicles",
+        "Working capital": "npl_free_pj_wc",
+        "Credit card": "npl_free_pj_card",
+        "Receivables discounting": "npl_free_pj_receivables",
+        "Companies total": "npl_free_pj",
+    }), total="Companies total")
+with b:
+    chart("22 · Companies — working capital by term", "NPL, %, SA", _npl_sa({
+        "Over 365 days": "npl_free_pj_wc_long",
+        "Up to 365 days": "npl_free_pj_wc_short",
+        "Revolving": "npl_free_pj_wc_revolving",
+        "Working capital total": "npl_free_pj_wc",
+    }), total="Working capital total")
 
 # ---------------------------------------------------------------------------
 # 6. Households
