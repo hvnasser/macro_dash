@@ -15,6 +15,7 @@ from bizdays import Calendar
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from data_pipeline.bcb_meetings import populate_meetings
+from data_pipeline.credit import CREDIT_SERIES, update_credit_data
 from data_pipeline.di_curve import (
     fetch_di_settlements,
     recalculate_curve_from_db,
@@ -186,6 +187,33 @@ if st.button("📅 Sync meetings calendar"):
         st.success(f"{n} official meetings synced." + (f" Removed: {', '.join(removed)}" if removed else ""))
     except Exception as e:
         st.error(str(e))
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Section 4 — Credit data (BCB SGS, monthly)
+# ---------------------------------------------------------------------------
+st.subheader("④ Credit data — BCB monthly  (`bcb_series`)")
+st.caption(
+    f"Downloads the full history of {len(CREDIT_SERIES)} BCB credit series and stores new months "
+    "and revisions (existing values are never overwritten). BCB publishes credit data "
+    "around the end of each month."
+)
+
+if st.button("💳 Download / refresh credit data", type="primary"):
+    bar = st.progress(0.0, text="Starting…")
+    result = update_credit_data(lambda i, n, name: bar.progress(i / n, text=f"{name}…"))
+    bar.empty()
+    st.cache_data.clear()
+    errors = result[result["error"] != ""]
+    added = int(result["rows_added"].sum())
+    latest = result["last_month"].dropna().max()
+    if errors.empty:
+        st.success(f"{added:,} new values saved · latest month: {latest}")
+    else:
+        st.warning(f"{added:,} new values saved · {len(errors)} series failed")
+    with st.expander("Details per series", expanded=not errors.empty):
+        st.dataframe(result, hide_index=True, width="stretch")
 
 st.divider()
 
