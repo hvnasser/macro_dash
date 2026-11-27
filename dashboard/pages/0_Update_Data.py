@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from data_pipeline.bcb_meetings import populate_meetings
 from data_pipeline.credit import CREDIT_SERIES, update_credit_data
+from data_pipeline.ipca import ITEMS as IPCA_ITEMS
+from data_pipeline.ipca import update_ipca_data
 from data_pipeline.di_curve import (
     fetch_di_settlements,
     recalculate_curve_from_db,
@@ -212,6 +214,30 @@ if st.button("💳 Download / refresh credit data", type="primary"):
         st.success(f"{added:,} new values saved · latest month: {latest}")
     else:
         st.warning(f"{added:,} new values saved · {len(errors)} series failed")
+    with st.expander("Details per series", expanded=not errors.empty):
+        st.dataframe(result, hide_index=True, width="stretch")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Section 5 — IPCA (BCB SGS, monthly)
+# ---------------------------------------------------------------------------
+st.subheader("⑤ IPCA — BCB monthly  (`bcb_series` + `ipca_metrics`)")
+st.caption(
+    f"Downloads {sum(1 for i in IPCA_ITEMS if i.code)} IPCA series (groups, classifications, cores), "
+    "stores new/revised raw values, then recalculates MoM SA, MM3M SAAR and YoY. "
+    "IBGE releases the IPCA around the 10th of each month."
+)
+
+if st.button("📈 Download / refresh IPCA data", type="primary"):
+    bar = st.progress(0.0, text="Starting…")
+    result = update_ipca_data(lambda i, n, name: bar.progress(i / n, text=f"{name}…"))
+    bar.empty()
+    st.cache_data.clear()
+    errors = result[result["error"] != ""]
+    latest = result["last_month"].dropna().max()
+    msg = f"{int(result['rows_added'].sum()):,} new raw values · metrics recalculated · latest month: {latest}"
+    (st.success if errors.empty else st.warning)(msg + ("" if errors.empty else f" · {len(errors)} series failed"))
     with st.expander("Details per series", expanded=not errors.empty):
         st.dataframe(result, hide_index=True, width="stretch")
 
