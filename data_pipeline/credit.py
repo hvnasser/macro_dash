@@ -217,8 +217,10 @@ def real(w: pd.DataFrame, col: str) -> pd.Series:
 def business_days(index: pd.DatetimeIndex) -> pd.Series:
     """ANBIMA business days in each month (NaN outside the calendar's range)."""
     def count(d: pd.Timestamp) -> float:
+        # Not _CAL.bizdays(first, next_first): it counts (start, end], dropping
+        # the 1st of the month whenever that is a business day.
         try:
-            return _CAL.bizdays(d.date(), (d + pd.offsets.MonthBegin(1)).date())
+            return float(sum(_CAL.isbizday(x.date()) for x in pd.date_range(d, d + pd.offsets.MonthEnd(0))))
         except Exception:
             return np.nan
     return pd.Series([count(d) for d in index], index=index, dtype=float)
@@ -234,6 +236,29 @@ def seasonal_adjust(s: pd.Series) -> pd.Series:
         return s
     res = STL(np.log(x.asfreq("MS")), period=12, robust=True).fit()
     return np.exp(np.log(x) - res.seasonal).reindex(s.index)
+
+
+def seasonal_adjust_td(s: pd.Series) -> pd.Series:
+    """Seasonal + trading-day adjustment.
+
+    Flows don't scale 1:1 with business days (card spending follows calendar
+    days), so instead of dividing by business days we estimate the elasticity
+    to an unusual day count for that calendar month (as X-13 does with a
+    trading-day regressor) and remove only that effect before STL.
+    """
+    from statsmodels.tsa.seasonal import STL
+
+    x = s.dropna()
+    x = np.log(x[x > 0].asfreq("MS"))
+    if len(x) < 36 or x.isna().any():
+        return seasonal_adjust(s)
+    lbd = np.log(business_days(x.index))
+    dev = lbd - lbd.groupby(lbd.index.month).transform("mean")
+    resid = STL(x, period=12, robust=True).fit().resid
+    beta = np.polyfit(dev, resid, 1)[0]
+    adj = x - beta * dev
+    sa = adj - STL(adj, period=12, robust=True).fit().seasonal
+    return np.exp(sa).reindex(s.index)
 
 
 def yoy(s: pd.Series) -> pd.Series:

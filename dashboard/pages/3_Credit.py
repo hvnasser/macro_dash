@@ -108,10 +108,9 @@ def _bn(s: pd.Series) -> pd.Series:
 # Derived series
 # ---------------------------------------------------------------------------
 bd = cr.business_days(w.index)
-avg_bd = bd.loc["2012":].mean()
-# Trading-days adjusted (per business day, rescaled to an average month) then SA
-new_sa = {k: cr.seasonal_adjust(cr.real(w, f"new_{k}") / bd) * avg_bd for k in ("total", "pj", "pf")}
-new_sa_only = cr.seasonal_adjust(cr.real(w, "new_total"))
+# Headline = seasonally adjusted only (same convention as J.P. Morgan's "CPI deflated, sa")
+new_sa = {k: cr.seasonal_adjust(cr.real(w, f"new_{k}")) for k in ("total", "pj", "pf")}
+new_td_sa = cr.seasonal_adjust_td(cr.real(w, "new_total"))
 gdp = cr.gdp_12m(w)
 banks_total = w["stock_public_banks"] + w["stock_private_banks"]
 ryoy = {c: cr.yoy(cr.real(w, c)) for c in [
@@ -156,14 +155,14 @@ st.divider()
 st.subheader("New loans (concessões)")
 a, b = st.columns(2)
 with a:
-    chart("2 · New loans", "R$ billion, IPCA-deflated, SA and trading-days adjusted", {"Total": _bn(new_sa["total"])})
+    chart("2 · New loans", "R$ billion, IPCA-deflated, seasonally adjusted", {"Total": _bn(new_sa["total"])})
 with b:
-    chart("3 · New loans to corporates and households", "R$ billion, IPCA-deflated, SA and trading-days adjusted",
+    chart("3 · New loans to corporates and households", "R$ billion, IPCA-deflated, seasonally adjusted",
           {"Corporates": _bn(new_sa["pj"]), "Households": _bn(new_sa["pf"])})
 a, b = st.columns(2)
 with a:
     chart("4 · New loans growth", "% 3m/3m saar, IPCA-deflated",
-          {"Original": cr.growth_3m_saar(new_sa_only), "Trading-days adjusted": cr.growth_3m_saar(new_sa["total"])},
+          {"Original": cr.growth_3m_saar(new_sa["total"]), "Trading-days adjusted": cr.growth_3m_saar(new_td_sa)},
           zero=True, since=max(start, pd.Timestamp(2019, 1, 1)))
 with b:
     chart("18 · New loans — private payroll-deductible", "R$ billion per business day, IPCA-deflated",
